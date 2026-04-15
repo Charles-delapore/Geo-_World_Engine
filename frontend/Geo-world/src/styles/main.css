@@ -31,29 +31,34 @@ textarea {
 }
 
 .app-shell {
-  width: min(1320px, calc(100vw - 32px));
+  width: min(1520px, calc(100vw - 32px));
   margin: 0 auto;
-  padding: 32px 0 48px;
+  padding: 24px 0 40px;
 }
 
-.hero-panel,
+.control-deck,
 .workspace-grid {
   display: grid;
   gap: 20px;
 }
 
-.hero-panel {
-  grid-template-columns: 1.1fr 0.9fr;
+.control-deck {
+  grid-template-columns: minmax(260px, 0.52fr) minmax(760px, 1.48fr);
   align-items: start;
-  margin-bottom: 24px;
+  margin-bottom: 18px;
+  padding: 20px 22px;
+  backdrop-filter: blur(16px);
+  background: rgba(10, 18, 24, 0.54);
+  border: 1px solid rgba(255, 241, 212, 0.16);
+  border-radius: 24px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
 }
 
 .workspace-grid {
-  grid-template-columns: 340px 1fr;
+  grid-template-columns: 290px minmax(0, 1fr);
 }
 
 .hero-copy,
-.task-form,
 .status-panel,
 .artifact-panel,
 .placeholder-card {
@@ -65,10 +70,9 @@ textarea {
 }
 
 .hero-copy,
-.task-form,
 .status-panel,
 .artifact-panel {
-  padding: 24px;
+  padding: 22px;
 }
 
 .eyebrow,
@@ -84,13 +88,32 @@ textarea {
 .artifact-header h2,
 .stage-panel h2 {
   margin: 0;
-  font-size: clamp(2rem, 3vw, 3.2rem);
+  font-size: clamp(1.6rem, 2.1vw, 2.5rem);
   line-height: 1.05;
 }
 
 .hero-text,
 .stage-copy {
   color: rgba(245, 240, 230, 0.8);
+}
+
+.control-deck .hero-copy,
+.control-deck .task-form {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  padding: 0;
+}
+
+.hero-copy {
+  min-height: 0;
+  max-width: 460px;
+}
+
+.hero-text {
+  max-width: 34ch;
+  font-size: 0.96rem;
 }
 
 .task-form,
@@ -161,17 +184,18 @@ textarea {
 
 .status-panel,
 .artifact-panel {
-  min-height: 520px;
+  min-height: 620px;
+}
+
+.stage-panel {
+  display: grid;
+  gap: 14px;
 }
 
 .status-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin-top: 18px;
-}
-
-.progress-shell {
   margin-top: 18px;
 }
 
@@ -196,6 +220,33 @@ textarea {
   font-size: 0.9rem;
 }
 
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.metric-card {
+  padding: 12px 12px 11px;
+  border-radius: 16px;
+  background: rgba(255, 250, 238, 0.05);
+  border: 1px solid rgba(255, 240, 214, 0.1);
+}
+
+.metric-label {
+  display: block;
+  margin-bottom: 4px;
+  color: rgba(245, 240, 230, 0.62);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+}
+
+.metric-value {
+  display: block;
+  color: #fff3d5;
+  font-size: 1rem;
+}
+
 .artifact-header {
   display: flex;
   justify-content: space-between;
@@ -205,15 +256,53 @@ textarea {
 }
 
 .artifact-body {
-  min-height: 430px;
+  min-height: 560px;
   display: grid;
+  position: relative;
 }
 
 .placeholder-card,
 .preview-shell,
 .interactive-shell {
   width: 100%;
-  min-height: 430px;
+  min-height: 560px;
+}
+
+.artifact-overlay {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  top: 18px;
+  z-index: 3;
+  padding: 16px 18px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(10, 18, 24, 0.88), rgba(10, 18, 24, 0.56));
+  border: 1px solid rgba(255, 240, 214, 0.14);
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.2);
+}
+
+.overlay-title {
+  margin: 0 0 6px;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.overlay-copy {
+  margin: 0 0 12px;
+  color: rgba(245, 240, 230, 0.76);
+  max-width: 56ch;
+}
+
+.map-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at 50% 35%, rgba(70, 112, 148, 0.26), transparent 28%),
+    linear-gradient(180deg, rgba(12, 24, 35, 0.88), rgba(6, 12, 18, 0.92));
+  color: rgba(245, 240, 230, 0.72);
 }
 
 .placeholder-card {
@@ -235,12 +324,12 @@ textarea {
 .interactive-map {
   width: 100%;
   height: 100%;
-  min-height: 430px;
+  min-height: 560px;
   display: block;
 }
 
 .preview-image {
-  object-fit: contain;
+  object-fit: cover;
   background:
     linear-gradient(180deg, rgba(21, 44, 61, 0.85), rgba(8, 13, 18, 0.85));
 }
@@ -250,7 +339,7 @@ textarea {
 }
 
 @media (max-width: 980px) {
-  .hero-panel,
+  .control-deck,
   .workspace-grid,
   .task-grid {
     grid-template-columns: 1fr;
@@ -259,6 +348,15 @@ textarea {
   .app-shell {
     width: min(100vw - 24px, 1320px);
     padding-top: 20px;
+  }
+
+  .artifact-body,
+  .placeholder-card,
+  .preview-shell,
+  .interactive-shell,
+  .preview-image,
+  .interactive-map {
+    min-height: 420px;
   }
 
   .artifact-header {

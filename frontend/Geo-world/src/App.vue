@@ -19,6 +19,7 @@ const { task, isPolling, startPolling, refresh } = useTaskPolling(taskId)
 const canShowPreview = computed(() => Boolean(task.value?.previewUrl))
 const canShowInteractive = computed(() => Boolean(task.value?.manifestUrl))
 const shouldShowProcessing = computed(() => !task.value || task.value.status === 'processing')
+const showMapPlaceholder = computed(() => !canShowPreview.value && !showInteractive.value)
 
 async function handleSubmit(payload: TaskFormPayload) {
   isSubmitting.value = true
@@ -59,15 +60,15 @@ function toggleInteractive() {
 
 <template>
   <div class="app-shell">
-    <section class="hero-panel">
+    <section class="control-deck">
       <div class="hero-copy">
         <p class="eyebrow">Geo-WorldEngine Beta</p>
         <h1>单一任务资源驱动的世界生成前台</h1>
         <p class="hero-text">
-          默认展示静态预览图，交互瓦片只在产物就绪后由用户主动切换。当前这版已经接入 beta 后端任务状态机与预览链路。
+          默认展示静态预览图，交互瓦片只在产物就绪后由用户主动切换。上半区合并为单一控制台，当前任务的约束摘要和模拟参数会在下方持续刷新。
         </p>
       </div>
-      <TaskForm :submitting="isSubmitting" @submit="handleSubmit" />
+      <TaskForm class="control-form" :submitting="isSubmitting" @submit="handleSubmit" />
     </section>
 
     <section class="workspace-grid">
@@ -78,7 +79,6 @@ function toggleInteractive() {
           :submit-error="submitError"
           @confirm="handleConfirm"
         />
-        <ProgressBar :value="task?.progress ?? 0" />
         <div class="status-actions">
           <button
             class="secondary-button"
@@ -109,8 +109,16 @@ function toggleInteractive() {
         </header>
 
         <div class="artifact-body">
-          <div v-if="shouldShowProcessing" class="placeholder-card">
-            <p>提交任务后，这里会首先展示生成进度，再展示首屏预览图。</p>
+          <div v-if="shouldShowProcessing" class="artifact-overlay">
+            <p class="overlay-title">{{ task?.currentStage ?? '等待新任务' }}</p>
+            <p class="overlay-copy">
+              {{ task ? '生成进行中，预览图会在首个产物完成后自动替换这里。' : '提交任务后，这里会直接显示地图区域中的生成进度。' }}
+            </p>
+            <ProgressBar :value="task?.progress ?? 0" />
+          </div>
+
+          <div v-if="showMapPlaceholder" class="map-placeholder">
+            <p>预览图尚未生成。</p>
           </div>
 
           <MapPreview

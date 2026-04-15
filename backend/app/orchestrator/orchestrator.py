@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from io import BytesIO
+from uuid import UUID
 
 from PIL import Image
 
@@ -15,6 +16,15 @@ from app.workers.tile_worker import generate_tiles
 
 
 repo = ArtifactRepository()
+
+
+def _resolve_seed(task_id: str, params: dict) -> int:
+    if params.get("seed") is not None:
+        return int(params["seed"])
+    try:
+        return int(UUID(task_id).int % 100000)
+    except ValueError:
+        return sum(ord(char) for char in task_id) % 100000
 
 
 def orchestrate_task(task_id: str) -> None:
@@ -47,7 +57,7 @@ def execute_generation(task_id: str) -> None:
             raise ValueError(f"Task {task_id} not found")
         width = int(task.params.get("width", settings.DEFAULT_WIDTH))
         height = int(task.params.get("height", settings.DEFAULT_HEIGHT))
-        seed = int(task.params.get("seed") or abs(hash(task.task_id)) % 100000)
+        seed = _resolve_seed(task.task_id, task.params or {})
         plan_json = task.plan_json or {}
 
     transition_task(task_id, TaskStatus.SIMULATING, progress=60, reason="render")

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.orchestrator.orchestrator import queue_generation, queue_orchestrator
+from app.orchestrator.orchestrator import _resolve_seed, queue_generation, queue_orchestrator
 from app.orchestrator.state_machine import PUBLIC_STATUS
 from app.storage.artifact_repo import ArtifactRepository
 from app.storage.models import TaskRecord, TaskStatus, get_db, session_scope
@@ -38,6 +38,7 @@ class MapResource(BaseModel):
     manifestUrl: str | None
     errorMsg: str | None
     planSummary: str | None
+    diagnostics: dict
     createdAt: datetime
     updatedAt: datetime
 
@@ -51,6 +52,27 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
     manifest_url = (
         _artifact_url(request, f"{settings.API_V1_STR}/maps/{task.task_id}/tiles/manifest.json") if task.tiles_ready else None
     )
+    plan = task.plan_json or {}
+    profile = plan.get("profile") or {}
+    constraints = plan.get("constraints") or {}
+    params = task.params or {}
+    diagnostics = {
+        "seed": _resolve_seed(task.task_id, params),
+        "width": int(params.get("width", settings.DEFAULT_WIDTH)),
+        "height": int(params.get("height", settings.DEFAULT_HEIGHT)),
+        "layoutTemplate": profile.get("layout_template", "default"),
+        "seaStyle": profile.get("sea_style", "open"),
+        "landRatio": float(profile.get("land_ratio", 0.44)),
+        "ruggedness": float(profile.get("ruggedness", 0.55)),
+        "coastComplexity": float(profile.get("coast_complexity", 0.5)),
+        "islandFactor": float(profile.get("island_factor", 0.25)),
+        "moisture": float(profile.get("moisture", 1.0)),
+        "temperatureBias": float(profile.get("temperature_bias", 0.0)),
+        "windDirection": profile.get("wind_direction", "westerly"),
+        "continentCount": len(constraints.get("continents") or []),
+        "mountainCount": len(constraints.get("mountains") or []),
+        "seaZoneCount": len(constraints.get("sea_zones") or []),
+    }
     return MapResource(
         taskId=task.task_id,
         status=PUBLIC_STATUS[TaskStatus(task.status)],
@@ -60,6 +82,7 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
         manifestUrl=manifest_url,
         errorMsg=task.error_msg,
         planSummary=task.plan_summary,
+        diagnostics=diagnostics,
         createdAt=task.created_at,
         updatedAt=task.updated_at,
     )

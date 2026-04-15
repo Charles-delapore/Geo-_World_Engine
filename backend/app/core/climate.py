@@ -15,7 +15,12 @@ except ImportError:  # pragma: no cover - optional acceleration
 
 
 @jit(nopython=True)
-def calculate_temperature(elev: np.ndarray, latitude: np.ndarray, lapse_rate: float = 0.0065) -> np.ndarray:
+def calculate_temperature(
+    elev: np.ndarray,
+    latitude: np.ndarray,
+    lapse_rate: float = 0.0065,
+    temperature_bias: float = 0.0,
+) -> np.ndarray:
     """
     根据海拔和纬度计算温度（摄氏度）
     
@@ -33,7 +38,7 @@ def calculate_temperature(elev: np.ndarray, latitude: np.ndarray, lapse_rate: fl
     base_temp = 30.0 * np.cos(lat_rad)
     
     # 海拔递减（每升高1000米降低6.5°C）
-    temp = base_temp - lapse_rate * elev
+    temp = base_temp - lapse_rate * elev + temperature_bias
     
     return temp
 
@@ -76,7 +81,28 @@ def calculate_precipitation(
                     precip[y, x] *= 1.5
                 elif grad_x[y, x] < 0:  # 东坡（雨影）
                     precip[y, x] *= 0.7
-    
+    elif wind_direction == 'easterly':
+        for y in range(height):
+            for x in range(width):
+                if grad_x[y, x] < 0:
+                    precip[y, x] *= 1.45
+                elif grad_x[y, x] > 0:
+                    precip[y, x] *= 0.72
+    elif wind_direction == 'northerly':
+        for y in range(height):
+            for x in range(width):
+                if grad_y[y, x] > 0:
+                    precip[y, x] *= 1.35
+                elif grad_y[y, x] < 0:
+                    precip[y, x] *= 0.76
+    elif wind_direction == 'southerly':
+        for y in range(height):
+            for x in range(width):
+                if grad_y[y, x] < 0:
+                    precip[y, x] *= 1.35
+                elif grad_y[y, x] > 0:
+                    precip[y, x] *= 0.76
+
     # 应用湿度因子
     precip *= moisture_factor
     
@@ -132,7 +158,12 @@ class ClimateSimulator:
         self.elev = elev
         self.lat_grid = lat_grid
     
-    def run(self, wind_direction: str = 'westerly') -> Dict[str, np.ndarray]:
+    def run(
+        self,
+        wind_direction: str = 'westerly',
+        moisture_factor: float = 1.0,
+        temperature_bias: float = 0.0,
+    ) -> Dict[str, np.ndarray]:
         """
         运行气候模拟
         
@@ -143,10 +174,10 @@ class ClimateSimulator:
             包含温度、降水、生物群系的字典
         """
         # 计算温度
-        temp = calculate_temperature(self.elev, self.lat_grid)
+        temp = calculate_temperature(self.elev, self.lat_grid, temperature_bias=temperature_bias)
         
         # 计算降水
-        precip = calculate_precipitation(self.elev, wind_direction)
+        precip = calculate_precipitation(self.elev, wind_direction, moisture_factor)
         
         # 分类生物群系
         biome = classify_biome(temp, precip)

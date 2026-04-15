@@ -59,6 +59,19 @@ class MapConstraints(BaseModel):
     river_sources: List[str] = Field(default_factory=list)
 
 
+class WorldProfile(BaseModel):
+    land_ratio: float = Field(0.44, ge=0.2, le=0.8)
+    ruggedness: float = Field(0.55, ge=0.0, le=1.0)
+    coast_complexity: float = Field(0.5, ge=0.0, le=1.0)
+    island_factor: float = Field(0.25, ge=0.0, le=1.0)
+    moisture: float = Field(1.0, ge=0.4, le=1.8)
+    temperature_bias: float = Field(0.0, ge=-14.0, le=14.0)
+    wind_direction: str = Field("westerly")
+    palette_hint: str = Field("temperate")
+    layout_template: str = Field("default")
+    sea_style: str = Field("open")
+
+
 class ConstraintMapper:
     """Compatibility wrapper that applies constraints through TerrainGenerator."""
 
@@ -218,6 +231,100 @@ def get_constraints_summary(constraints: MapConstraints) -> str:
     return "\n".join(parts) if parts else "No special constraints detected."
 
 
+def infer_world_profile(prompt: str, constraints: MapConstraints) -> WorldProfile:
+    lower = _normalize_prompt(prompt)
+    profile = WorldProfile()
+    has_inland_sea = _contains_any(lower, ["inland sea", "inner sea", "enclosed sea", "内海", "内陆海"])
+    has_open_separator = _contains_any(lower, ["隔着海", "被海隔开", "ocean between", "sea between", "separated by sea"])
+    has_strait_or_bay = _contains_any(lower, ["海峡", "strait", "gulf", "bay", "海湾"])
+
+    if _contains_any(lower, ["surrounded by sea", "island continent", "四面环海", "环海大陆", "海中大陆"]):
+        profile.layout_template = "single_island"
+        profile.land_ratio = 0.38
+        profile.coast_complexity = 0.88
+        profile.island_factor = 0.18
+        profile.sea_style = "open"
+    elif _contains_any(lower, ["supercontinent", "single continent", "盘古大陆", "超大陆", "单一大陆"]):
+        profile.layout_template = "supercontinent"
+        profile.land_ratio = 0.62
+        profile.island_factor = 0.08
+    elif len(constraints.continents) >= 3 or _contains_any(lower, ["archipelago", "islands", "群岛", "列岛"]):
+        profile.layout_template = "archipelago"
+        profile.land_ratio = 0.32
+        profile.island_factor = 0.75
+        profile.coast_complexity = 0.82
+    elif len(constraints.continents) == 2:
+        positions = {item.position for item in constraints.continents}
+        if {"west", "east"} <= positions:
+            profile.layout_template = "split_east_west"
+        elif {"north", "south"} <= positions:
+            profile.layout_template = "split_north_south"
+        profile.land_ratio = 0.46
+        profile.coast_complexity = 0.62
+
+    if has_inland_sea:
+        profile.sea_style = "inland"
+    elif has_open_separator:
+        profile.sea_style = "open"
+    elif has_strait_or_bay:
+        profile.sea_style = "strait"
+
+    if constraints.sea_zones or has_inland_sea or has_strait_or_bay:
+        profile.coast_complexity = max(profile.coast_complexity, 0.72)
+        profile.land_ratio = min(profile.land_ratio, 0.5)
+        if has_inland_sea and len(constraints.continents) >= 2:
+            profile.layout_template = "mediterranean"
+        elif profile.layout_template == "default" and len(constraints.continents) >= 2:
+            profile.layout_template = "mediterranean"
+
+    if has_open_separator and profile.layout_template == "default" and len(constraints.continents) >= 2:
+        positions = {item.position for item in constraints.continents}
+        if {"west", "east"} <= positions:
+            profile.layout_template = "split_east_west"
+        elif {"north", "south"} <= positions:
+            profile.layout_template = "split_north_south"
+
+    if constraints.mountains or _contains_any(lower, ["mountainous", "rugged", "山脉", "高山", "峡谷", "崇山"]):
+        profile.ruggedness = 0.85
+    if _contains_any(lower, ["flat", "plain", "gentle", "平原", "平坦", "缓丘"]):
+        profile.ruggedness = 0.28
+
+    if _contains_any(lower, ["jagged", "fractured", "broken coast", "崎岖海岸", "破碎海岸"]):
+        profile.coast_complexity = 0.9
+    if _contains_any(lower, ["smooth coast", "round coast", "平滑海岸", "圆润海岸"]):
+        profile.coast_complexity = 0.24
+
+    if _contains_any(lower, ["desert", "arid", "dry", "沙漠", "干旱"]):
+        profile.moisture = 0.55
+        profile.temperature_bias = max(profile.temperature_bias, 4.0)
+        profile.palette_hint = "arid"
+    elif _contains_any(lower, ["lush", "wet", "rainforest", "swamp", "湿润", "雨林", "沼泽"]):
+        profile.moisture = 1.45
+        profile.palette_hint = "lush"
+
+    if _contains_any(lower, ["frozen", "glacial", "icy", "tundra", "冰雪", "冻土", "寒冷"]):
+        profile.temperature_bias = -9.0
+        profile.palette_hint = "frozen"
+    elif _contains_any(lower, ["tropical", "equatorial", "warm", "热带", "温暖", "赤道"]):
+        profile.temperature_bias = 6.0
+        profile.moisture = max(profile.moisture, 1.15)
+        profile.palette_hint = "tropical"
+
+    if _contains_any(lower, ["easterly", "eastern winds", "东风"]):
+        profile.wind_direction = "easterly"
+    elif _contains_any(lower, ["northerly", "north wind", "北风"]):
+        profile.wind_direction = "northerly"
+    elif _contains_any(lower, ["southerly", "south wind", "南风"]):
+        profile.wind_direction = "southerly"
+
+    if _contains_any(lower, ["volcanic", "lava", "火山", "熔岩"]):
+        profile.ruggedness = max(profile.ruggedness, 0.92)
+        profile.palette_hint = "volcanic"
+        profile.temperature_bias = max(profile.temperature_bias, 3.0)
+
+    return profile
+
+
 def _extract_positions(prompt: str) -> List[str]:
     normalized = _normalize_prompt(prompt)
     results: List[str] = []
@@ -252,6 +359,9 @@ def _extract_continent_positions(prompt: str, positions: List[str]) -> List[str]
 def _extract_feature_positions(prompt: str, positions: List[str], terms: List[str]) -> List[str]:
     normalized = _normalize_prompt(prompt)
     terms_pattern = "|".join(map(re.escape, terms))
+    paired_feature_positions = _extract_feature_position_pairs(normalized, terms_pattern)
+    if paired_feature_positions:
+        return paired_feature_positions
     ranked: List[str] = []
     for canonical, phrases in COMPOSITE_POSITION_HINTS.items():
         if any(
@@ -267,6 +377,20 @@ def _extract_feature_positions(prompt: str, positions: List[str], terms: List[st
                 ranked.append(canonical)
                 break
     return _dedupe(ranked or positions or ["center"])
+
+
+def _extract_feature_position_pairs(normalized: str, terms_pattern: str) -> List[str]:
+    results: List[str] = []
+    for canonical, aliases in POSITION_ALIASES.items():
+        for alias in aliases:
+            alias_pattern = _alias_pattern(alias)
+            if re.search(rf"{alias_pattern}.{{0,18}}(?:的)?(?:大陆|continent|landmass).{{0,18}}(?:有|with)?(?:{terms_pattern})", normalized):
+                results.append(canonical)
+                break
+            if re.search(rf"(?:{terms_pattern}).{{0,18}}位于.{{0,8}}{alias_pattern}(?:的)?(?:大陆|continent|landmass)?", normalized):
+                results.append(canonical)
+                break
+    return _dedupe(results)
 
 
 def _extract_size(lower: str, position: str) -> float:

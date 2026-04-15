@@ -7,6 +7,23 @@ export interface CreateMapRequest {
   generate_tiles: boolean
 }
 
+export interface MapDiagnostics {
+  seed?: number
+  width: number
+  height: number
+  layoutTemplate: string
+  landRatio: number
+  ruggedness: number
+  coastComplexity: number
+  islandFactor: number
+  moisture: number
+  temperatureBias: number
+  windDirection: string
+  continentCount: number
+  mountainCount: number
+  seaZoneCount: number
+}
+
 export interface MapTask {
   taskId: string
   status: 'processing' | 'awaiting-confirm' | 'ready-image' | 'ready-interactive' | 'failed'
@@ -16,6 +33,7 @@ export interface MapTask {
   manifestUrl: string | null
   errorMsg: string | null
   planSummary: string | null
+  diagnostics: MapDiagnostics
   createdAt: string
   updatedAt: string
 }
