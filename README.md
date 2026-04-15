@@ -1,4 +1,8 @@
-<<<<<<< HEAD
+
+# Geo_World_Engine
+Geo-WorldEngine(Beta) 是一个调试中的AI驱动程序化幻想地图生成系统。融合LLM语义理解、计算几何、物理模拟和分布式任务调度,支持自然语言约束的交互式世界构建。
+这个项目仍然在草创阶段，而且大部分工作由agent完成（我指的是codex），后续将会持续优化。【welcome stars and contributions!】
+=======
 # Geo-WorldEngine Beta
 
 Geo-WorldEngine Beta is the beta-generation workspace for the world map pipeline. It currently includes:
@@ -98,8 +102,4 @@ Known limitations at this stage:
 - refine terrain, climate, and biome rendering quality
 - add structured logging, metrics, and retry policy controls
 - tighten production deployment assumptions around PostgreSQL-only execution
-=======
-# Geo-_World_Engine
-Geo-WorldEngine(Beta) 是一个调试中的AI驱动程序化幻想地图生成系统。融合LLM语义理解、计算几何、物理模拟和分布式任务调度,支持自然语言约束的交互式世界构建。
-这个项目仍然在草创阶段，而且大部分工作由agent完成（我指的是codex），后续将会持续优化。【路过的HR留下星标再走！】
->>>>>>> e758cb4135fa04c0a96df909d949bcf1631fab96
+
