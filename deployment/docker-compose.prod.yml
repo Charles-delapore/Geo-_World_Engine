@@ -1,0 +1,47 @@
+services:
+  backend-api:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready').read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  celery-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      RUN_DB_MIGRATIONS: "false"
+    command: python celery_worker.py
+
+  celery-tile:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      RUN_DB_MIGRATIONS: "false"
+    command: python tile_worker.py
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Geo-world/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      backend-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 10s
+      retries: 5

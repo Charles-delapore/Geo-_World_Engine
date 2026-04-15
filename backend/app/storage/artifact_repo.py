@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+import io
+import json
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+from app.config import settings
+from app.storage.s3_client import s3_client
+
+
+class ArtifactRepository:
+    def __init__(self, root: Path | None = None):
+        self.root = Path(root or settings.ARTIFACT_ROOT)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def task_dir(self, task_id: str) -> Path:
+        path = self.root / "maps" / task_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def preview_path(self, task_id: str) -> Path:
+        return self.task_dir(task_id) / "preview.png"
+
+    def manifest_path(self, task_id: str) -> Path:
+        path = self.task_dir(task_id) / "tiles"
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "manifest.json"
+
+    def tile_path(self, task_id: str, z: int, x: int, y: int) -> Path:
+        path = self.task_dir(task_id) / "tiles" / str(z) / str(x)
+        path.mkdir(parents=True, exist_ok=True)
+        return path / f"{y}.png"
+
+    def world_path(self, task_id: str) -> Path:
+        return self.task_dir(task_id) / "world.npz"
+
+    def _uses_s3(self) -> bool:
+        return settings.ARTIFACT_BACKEND.lower() == "s3"
+
+    def _object_key(self, *parts: str) -> str:
+        return "/".join(part.strip("/\\") for part in parts)
+
+    def save_preview(self, task_id: str, image: Image.Image) -> Path:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data = buffer.getvalue()
+        if self._uses_s3():
+            s3_client.put_bytes(self._object_key("maps", task_id, "preview.png"), data, "image/png")
+            return self.preview_path(task_id)
+        path = self.preview_path(task_id)
+        path.write_bytes(data)
+        return path
+
+    def save_world(self, task_id: str, **arrays: np.ndarray) -> Path:
+        buffer = io.BytesIO()
+        np.savez_compressed(buffer, **arrays)
+        data = buffer.getvalue()
+        if self._uses_s3():
+            s3_client.put_bytes(self._object_key("maps", task_id, "world.npz"), data, "application/octet-stream")
+            return self.world_path(task_id)
+        path = self.world_path(task_id)
+        path.write_bytes(data)
+        return path
+
+    def save_manifest(self, task_id: str, manifest: dict) -> Path:
+        data = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        if self._uses_s3():
+            s3_client.put_bytes(self._object_key("maps", task_id, "tiles", "manifest.json"), data, "application/json")
+            return self.manifest_path(task_id)
+        path = self.manifest_path(task_id)
+        path.write_bytes(data)
+        return path
+
+    def save_tile_image(self, task_id: str, z: int, x: int, y: int, image: Image.Image) -> Path:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data = buffer.getvalue()
+        if self._uses_s3():
+            s3_client.put_bytes(self._object_key("maps", task_id, "tiles", str(z), str(x), f"{y}.png"), data, "image/png")
+            return self.tile_path(task_id, z, x, y)
+        path = self.tile_path(task_id, z, x, y)
+        path.write_bytes(data)
+        return path
+
+    def load_world(self, task_id: str) -> dict[str, np.ndarray]:
+        if self._uses_s3():
+            payload = io.BytesIO(s3_client.get_bytes(self._object_key("maps", task_id, "world.npz")))
+            data_handle = np.load(payload)
+        else:
+            data_handle = np.load(self.world_path(task_id))
+        with data_handle as data:
+            return {key: data[key] for key in data.files}
+
+    def has_preview(self, task_id: str) -> bool:
+        if self._uses_s3():
+            return s3_client.exists(self._object_key("maps", task_id, "preview.png"))
+        return self.preview_path(task_id).exists()
+
+    def has_manifest(self, task_id: str) -> bool:
+        if self._uses_s3():
+            return s3_client.exists(self._object_key("maps", task_id, "tiles", "manifest.json"))
+        return self.manifest_path(task_id).exists()
+
+    def has_tile(self, task_id: str, z: int, x: int, y: int) -> bool:
+        if self._uses_s3():
+            return s3_client.exists(self._object_key("maps", task_id, "tiles", str(z), str(x), f"{y}.png"))
+        return self.tile_path(task_id, z, x, y).exists()
+
+    def read_preview_bytes(self, task_id: str) -> bytes:
+        if self._uses_s3():
+            return s3_client.get_bytes(self._object_key("maps", task_id, "preview.png"))
+        return self.preview_path(task_id).read_bytes()
+
+    def read_manifest_bytes(self, task_id: str) -> bytes:
+        if self._uses_s3():
+            return s3_client.get_bytes(self._object_key("maps", task_id, "tiles", "manifest.json"))
+        return self.manifest_path(task_id).read_bytes()
+
+    def read_tile_bytes(self, task_id: str, z: int, x: int, y: int) -> bytes:
+        if self._uses_s3():
+            return s3_client.get_bytes(self._object_key("maps", task_id, "tiles", str(z), str(x), f"{y}.png"))
+        return self.tile_path(task_id, z, x, y).read_bytes()
+
+    def transparent_tile_bytes(self, size: int | None = None) -> bytes:
+        image = Image.new("RGBA", (size or settings.DEFAULT_TILE_SIZE, size or settings.DEFAULT_TILE_SIZE), (0, 0, 0, 0))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()

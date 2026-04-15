@@ -1,0 +1,268 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #f5f0e6;
+  background:
+    radial-gradient(circle at top left, rgba(218, 172, 90, 0.22), transparent 32%),
+    radial-gradient(circle at top right, rgba(80, 120, 167, 0.28), transparent 30%),
+    linear-gradient(135deg, #10212d 0%, #162f3c 54%, #5e4529 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.app-shell {
+  width: min(1320px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 32px 0 48px;
+}
+
+.hero-panel,
+.workspace-grid {
+  display: grid;
+  gap: 20px;
+}
+
+.hero-panel {
+  grid-template-columns: 1.1fr 0.9fr;
+  align-items: start;
+  margin-bottom: 24px;
+}
+
+.workspace-grid {
+  grid-template-columns: 340px 1fr;
+}
+
+.hero-copy,
+.task-form,
+.status-panel,
+.artifact-panel,
+.placeholder-card {
+  backdrop-filter: blur(16px);
+  background: rgba(10, 18, 24, 0.54);
+  border: 1px solid rgba(255, 241, 212, 0.16);
+  border-radius: 24px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+}
+
+.hero-copy,
+.task-form,
+.status-panel,
+.artifact-panel {
+  padding: 24px;
+}
+
+.eyebrow,
+.artifact-kicker {
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.75rem;
+  color: #f2c97c;
+}
+
+.hero-copy h1,
+.artifact-header h2,
+.stage-panel h2 {
+  margin: 0;
+  font-size: clamp(2rem, 3vw, 3.2rem);
+  line-height: 1.05;
+}
+
+.hero-text,
+.stage-copy {
+  color: rgba(245, 240, 230, 0.8);
+}
+
+.task-form,
+.task-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.task-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.task-form label {
+  display: grid;
+  gap: 8px;
+}
+
+.task-form span {
+  color: rgba(255, 240, 214, 0.84);
+  font-size: 0.92rem;
+}
+
+.task-form textarea,
+.task-form input {
+  width: 100%;
+  border: 1px solid rgba(255, 240, 214, 0.16);
+  border-radius: 14px;
+  background: rgba(255, 250, 238, 0.07);
+  color: #fff8ea;
+  padding: 12px 14px;
+}
+
+.checkbox-row {
+  grid-auto-flow: column;
+  justify-content: start;
+  align-items: center;
+}
+
+.checkbox-row input {
+  width: 16px;
+  height: 16px;
+}
+
+.primary-button,
+.secondary-button {
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 18px;
+  cursor: pointer;
+}
+
+.primary-button {
+  background: linear-gradient(90deg, #d7a557 0%, #f2d18d 100%);
+  color: #1e2530;
+  font-weight: 700;
+}
+
+.secondary-button {
+  background: rgba(255, 248, 234, 0.08);
+  color: #fff4d8;
+}
+
+.primary-button:disabled,
+.secondary-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.status-panel,
+.artifact-panel {
+  min-height: 520px;
+}
+
+.status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.progress-shell {
+  margin-top: 18px;
+}
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 240, 214, 0.12);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #f0c47d 0%, #7bb0ca 100%);
+}
+
+.progress-label,
+.stage-meta,
+.task-chip {
+  color: rgba(245, 240, 230, 0.7);
+  font-size: 0.9rem;
+}
+
+.artifact-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.artifact-body {
+  min-height: 430px;
+  display: grid;
+}
+
+.placeholder-card,
+.preview-shell,
+.interactive-shell {
+  width: 100%;
+  min-height: 430px;
+}
+
+.placeholder-card {
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: 24px;
+}
+
+.preview-shell,
+.interactive-shell {
+  border-radius: 22px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 240, 214, 0.12);
+  background: rgba(5, 10, 15, 0.45);
+}
+
+.preview-image,
+.interactive-map {
+  width: 100%;
+  height: 100%;
+  min-height: 430px;
+  display: block;
+}
+
+.preview-image {
+  object-fit: contain;
+  background:
+    linear-gradient(180deg, rgba(21, 44, 61, 0.85), rgba(8, 13, 18, 0.85));
+}
+
+.error-text {
+  color: #ffb7a0;
+}
+
+@media (max-width: 980px) {
+  .hero-panel,
+  .workspace-grid,
+  .task-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .app-shell {
+    width: min(100vw - 24px, 1320px);
+    padding-top: 20px;
+  }
+
+  .artifact-header {
+    flex-direction: column;
+    align-items: start;
+  }
+}
