@@ -5,20 +5,25 @@ from PIL import Image
 
 from app.core.climate import ClimateSimulator
 from app.core.terrain import TerrainGenerator
+from app.core.terrain_modular import ModularTerrainGenerator
 
 
 def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[str, np.ndarray], Image.Image]:
+    backend = str((plan or {}).get("generation_backend") or "gaussian_voronoi")
     terrain = TerrainGenerator(width=width, height=height, seed=seed)
-    elevation = terrain.generate()
+    if backend == "modular":
+        elevation = ModularTerrainGenerator(width=width, height=height, seed=seed).generate(plan or {})
+    else:
+        elevation = terrain.generate()
 
     constraints = (plan or {}).get("constraints") or {}
     profile = (plan or {}).get("profile") or {}
     elevation, uses_hard_topology = _shape_world_profile(terrain, elevation, plan or {})
     if constraints:
         refinement_constraints = _constraints_for_refinement(constraints, profile, uses_hard_topology)
-        if refinement_constraints:
+        if refinement_constraints and not uses_hard_topology:
             elevation = terrain.apply_constraints(elevation, refinement_constraints)
-            elevation = terrain.reinforce_constraints(elevation, refinement_constraints, blend=0.48 if uses_hard_topology else 0.66)
+            elevation = terrain.reinforce_constraints(elevation, refinement_constraints, blend=0.66)
 
     filled = elevation
     latitude = np.linspace(90.0, -90.0, height, dtype=np.float32).reshape(height, 1)
@@ -28,19 +33,30 @@ def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[s
         moisture_factor=float(profile.get("moisture", 1.0)),
         temperature_bias=float(profile.get("temperature_bias", 0.0)),
     )
-    preview = _render_preview_image(filled, climate["biome"], climate["temperature"], climate["precipitation"], profile)
     arrays = {
         "elevation": filled.astype(np.float32),
         "temperature": climate["temperature"].astype(np.float32),
         "precipitation": climate["precipitation"].astype(np.float32),
         "biome": climate["biome"].astype(np.int16),
     }
+    preview = render_preview_from_arrays(arrays, profile)
     return arrays, preview
+
+
+def render_preview_from_arrays(arrays: dict[str, np.ndarray], profile: dict | None = None) -> Image.Image:
+    return _render_preview_image(
+        arrays["elevation"],
+        arrays["biome"],
+        arrays["temperature"],
+        arrays["precipitation"],
+        profile or {},
+    )
 
 
 def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, plan: dict) -> tuple[np.ndarray, bool]:
     profile = plan.get("profile") or {}
     constraints = plan.get("constraints") or {}
+    explicit_geometry = _has_explicit_plan_geometry(plan)
     land_ratio = float(profile.get("land_ratio", 0.44))
     ruggedness = float(profile.get("ruggedness", 0.55))
     coast_complexity = float(profile.get("coast_complexity", 0.5))
@@ -62,15 +78,18 @@ def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, plan:
     else:
         shaped = _apply_constraint_topology(terrain, shaped, constraints, coast_complexity, ruggedness)
 
-    shaped = _apply_layout_template(terrain, shaped, layout_template, sea_style, constraints, coast_complexity)
+    if not explicit_geometry:
+        shaped = _apply_layout_template(terrain, shaped, layout_template, sea_style, constraints, coast_complexity)
     shaped = _apply_constraint_topology(terrain, shaped, constraints, coast_complexity, ruggedness)
     shaped += (macro * 2.0 - 1.0) * (0.14 + coast_complexity * 0.12)
     shaped += (ridges * 2.0 - 1.0) * (0.08 + ruggedness * 0.24)
     shaped += (archipelago * 2.0 - 1.0) * island_factor * 0.18
     shaped += (coastline_noise * 2.0 - 1.0) * coast_complexity * 0.1
+    shaped = _apply_water_enforcement(terrain, shaped, plan)
     shaped = terrain._rebalance_sea_level(shaped, target_ocean=float(np.clip(1.0 - land_ratio, 0.28, 0.78)))
     shaped = np.tanh(shaped * (0.9 + ruggedness * 0.55)).astype(np.float32)
     shaped = terrain.apply_coastal_smoothing(shaped, sea_level=0.0, smoothing_radius=max(3, int(8 - coast_complexity * 4)))
+    shaped = _enforce_required_water_gaps(terrain, shaped, plan)
     return np.clip(shaped, -1.0, 1.0).astype(np.float32), uses_hard_topology
 
 
@@ -206,6 +225,8 @@ def _build_hard_topology(
 ) -> np.ndarray | None:
     constraints = plan.get("constraints") or {}
     explicit = _build_plan_structural_topology(terrain, plan, ruggedness)
+    if explicit is not None:
+        return explicit
 
     layout_field: np.ndarray | None = None
     if layout_template == "split_east_west":
@@ -215,9 +236,14 @@ def _build_hard_topology(
     elif layout_template == "single_island":
         layout_field = _build_single_island_topology(terrain, constraints, ruggedness)
 
-    if explicit is not None and layout_field is not None:
-        return _normalize_topology(layout_field * 0.4 + explicit * 0.6)
-    return explicit if explicit is not None else layout_field
+    return layout_field
+
+
+def _has_explicit_plan_geometry(plan: dict) -> bool:
+    return any(
+        plan.get(key)
+        for key in ("continents", "mountains", "peninsulas", "island_chains", "inland_seas", "water_bodies", "regional_relations")
+    )
 
 
 def _build_plan_structural_topology(terrain: TerrainGenerator, plan: dict, ruggedness: float) -> np.ndarray | None:
@@ -226,9 +252,11 @@ def _build_plan_structural_topology(terrain: TerrainGenerator, plan: dict, rugge
     peninsulas = list(plan.get("peninsulas") or [])
     island_chains = list(plan.get("island_chains") or [])
     inland_seas = list(plan.get("inland_seas") or [])
+    water_bodies = list(plan.get("water_bodies") or [])
+    regional_relations = list(plan.get("regional_relations") or [])
     constraints = plan.get("constraints") or {}
 
-    if not any([continents, mountains, peninsulas, island_chains, inland_seas]):
+    if not any([continents, mountains, peninsulas, island_chains, inland_seas, water_bodies, regional_relations]):
         return None
 
     field = np.full((terrain.height, terrain.width), -0.45, dtype=np.float32)
@@ -264,7 +292,17 @@ def _build_plan_structural_topology(terrain: TerrainGenerator, plan: dict, rugge
             str(inland_sea.get("connection", "strait")),
         ) * 1.35
 
+    for water_body in water_bodies:
+        field -= _plan_water_body_component(
+            terrain,
+            body_type=str(water_body.get("type", "ocean")),
+            position=str(water_body.get("position", "center")),
+            coverage=float(water_body.get("coverage", 0.25)),
+            connection=str(water_body.get("connection", "")),
+        )
+
     field = _apply_mountain_topology(terrain, field, {"mountains": mountains or constraints.get("mountains") or []}, ruggedness)
+    field = _apply_regional_relations(terrain, field, regional_relations)
     return _normalize_topology(field)
 
 
@@ -282,7 +320,8 @@ def _build_split_east_west_topology(terrain: TerrainGenerator, constraints: dict
         ]
     )
     center_spine = terrain._elliptic_gaussian(0.5, 0.5, 0.1, 0.46, 0.0)
-    open_channel = np.clip(open_channel * 0.84 + center_spine * 0.66, 0.0, 1.5)
+    full_channel = _axis_aligned_ocean_barrier(terrain, "vertical", center=0.5, width=0.11)
+    open_channel = np.clip(open_channel * 0.84 + center_spine * 0.66 + full_channel * 0.92, 0.0, 1.75)
 
     field = np.maximum(west, east) * 1.26 - open_channel * 1.42
     field = _apply_mountain_topology(terrain, field, constraints, ruggedness)
@@ -299,10 +338,13 @@ def _build_inland_sea_topology(terrain: TerrainGenerator, constraints: dict, rug
         terrain._elliptic_gaussian(0.5, 0.5, 0.14, 0.24, 0.0),
         terrain._create_location_mask("center", radius=0.16, sigma=0.38),
     )
+    basin = np.maximum(basin, terrain._elliptic_gaussian(0.5, 0.5, 0.2, 0.3, 0.0) * 0.88)
     west_outlet = terrain._elliptic_gaussian(0.5, 0.18, 0.05, 0.08, 0.0)
     east_outlet = terrain._elliptic_gaussian(0.5, 0.82, 0.05, 0.08, 0.0)
+    north_cut = terrain._elliptic_gaussian(0.34, 0.5, 0.06, 0.18, 0.0)
+    south_cut = terrain._elliptic_gaussian(0.66, 0.5, 0.06, 0.18, 0.0)
     enclosure = np.maximum.reduce([north_arc, south_arc, west_wall, east_wall]) * 1.2
-    field = enclosure - basin * 1.18 - (west_outlet + east_outlet) * 0.16
+    field = enclosure - basin * 1.34 - (west_outlet + east_outlet) * 0.22 - (north_cut + south_cut) * 0.24
     field = _apply_mountain_topology(terrain, field, constraints, ruggedness)
     return _normalize_topology(field)
 
@@ -382,23 +424,249 @@ def _plan_inland_sea_component(terrain: TerrainGenerator, position: str, connect
         terrain._elliptic_gaussian(cy, cx, 0.16, 0.12, 0.0),
         terrain._elliptic_gaussian(cy, cx, 0.11, 0.2, 0.0) * 0.84,
     )
+    basin = np.maximum(basin, terrain._elliptic_gaussian(cy, cx, 0.22, 0.3, 0.0) * 0.9)
     connection = (connection or "").lower()
     if "strait" in connection:
         basin = np.maximum(
             basin,
-            terrain._elliptic_gaussian(cy, np.clip(cx + 0.18, 0.04, 0.96), 0.05, 0.03, 0.0) * 0.82,
+            terrain._elliptic_gaussian(cy, np.clip(cx + 0.18, 0.04, 0.96), 0.06, 0.045, 0.0) * 0.88,
         )
     elif "east" in connection:
         basin = np.maximum(
             basin,
-            terrain._elliptic_gaussian(cy, np.clip(cx + 0.22, 0.04, 0.96), 0.07, 0.045, 0.0) * 0.7,
+            terrain._elliptic_gaussian(cy, np.clip(cx + 0.22, 0.04, 0.96), 0.08, 0.06, 0.0) * 0.84,
         )
     elif "west" in connection:
         basin = np.maximum(
             basin,
-            terrain._elliptic_gaussian(cy, np.clip(cx - 0.22, 0.04, 0.96), 0.07, 0.045, 0.0) * 0.7,
+            terrain._elliptic_gaussian(cy, np.clip(cx - 0.22, 0.04, 0.96), 0.08, 0.06, 0.0) * 0.84,
         )
     return gaussian_smooth(basin)
+
+
+def _plan_water_body_component(
+    terrain: TerrainGenerator,
+    body_type: str,
+    position: str,
+    coverage: float,
+    connection: str,
+) -> np.ndarray:
+    normalized_type = (body_type or "ocean").lower()
+    coverage = float(np.clip(coverage, 0.08, 0.68))
+    radius = 0.12 + coverage * 0.22
+    sigma = 0.28 + coverage * 0.62
+    mask = terrain._create_location_mask(position, radius=radius, sigma=sigma)
+
+    if "strait" in normalized_type:
+        rotation = terrain._position_rotation(position)
+        cy, cx = terrain._resolve_position(position)
+        channel = terrain._elliptic_gaussian(cy, cx, 0.08 + coverage * 0.12, 0.24 + coverage * 0.18, rotation)
+        return gaussian_smooth(np.maximum(mask * 0.8, channel) * (0.75 + coverage))
+
+    if "inland" in normalized_type:
+        return _plan_inland_sea_component(terrain, position, connection or "strait") * (0.72 + coverage)
+
+    if "ocean" in normalized_type or "sea" in normalized_type:
+        side_masks = [mask]
+        if position in {"west", "east", "north", "south"}:
+            side_masks.append(terrain._create_continent_mask(position, min(0.32 + coverage * 0.2, 0.58)))
+        return gaussian_smooth(np.maximum.reduce(side_masks) * (0.72 + coverage))
+
+    return gaussian_smooth(mask * (0.68 + coverage))
+
+
+def _apply_regional_relations(terrain: TerrainGenerator, field: np.ndarray, relations: list[dict]) -> np.ndarray:
+    if not relations:
+        return field
+
+    shaped = field.astype(np.float32).copy()
+    for relation in relations:
+        relation_type = str(relation.get("relation", "")).lower()
+        subject = str(relation.get("subject", "center"))
+        object_name = str(relation.get("object", "center"))
+        strength = float(np.clip(relation.get("strength", 1.0), 0.1, 1.2))
+
+        if relation_type == "separated_by_water":
+            shaped -= _separation_channel(terrain, subject, object_name, strength)
+        elif relation_type == "elevated_region":
+            ridge = terrain._create_mountain_chain_mask(subject)
+            shaped += gaussian_smooth(ridge * (0.12 + strength * 0.16))
+    return shaped
+
+
+def _separation_channel(terrain: TerrainGenerator, subject: str, object_name: str, strength: float) -> np.ndarray:
+    sy, sx = terrain._resolve_position(subject)
+    oy, ox = terrain._resolve_position(object_name)
+    cy = float(np.clip((sy + oy) * 0.5, 0.08, 0.92))
+    cx = float(np.clip((sx + ox) * 0.5, 0.04, 0.96))
+    dy = oy - sy
+    dx = ox - sx
+    rotation = float(np.arctan2(dy, dx)) + np.pi / 2.0
+    distance = min(np.hypot(dx, dy), 0.75)
+    length = 0.18 + distance * 0.78
+    width = 0.06 + strength * 0.05
+    trench = terrain._elliptic_gaussian(cy, cx, width, length, rotation)
+    if abs(dx) >= abs(dy) * 1.2:
+        trench = np.maximum(trench, _axis_aligned_ocean_barrier(terrain, "vertical", center=cx, width=width * 1.45))
+    elif abs(dy) >= abs(dx) * 1.2:
+        trench = np.maximum(trench, _axis_aligned_ocean_barrier(terrain, "horizontal", center=cy, width=width * 1.45))
+    center_cut = terrain._create_location_mask("center", radius=0.12 + strength * 0.04, sigma=0.28 + strength * 0.2)
+    return gaussian_smooth(np.maximum(trench, center_cut * 0.82) * (0.58 + strength * 0.34))
+
+
+def _axis_aligned_ocean_barrier(terrain: TerrainGenerator, axis: str, center: float, width: float) -> np.ndarray:
+    if axis == "vertical":
+        x = terrain._x_norm
+        barrier = np.exp(-((x - center) ** 2) / max(width**2, 1e-4))
+        return barrier.astype(np.float32)
+    y = terrain._y_norm
+    barrier = np.exp(-((y - center) ** 2) / max(width**2, 1e-4))
+    return barrier.astype(np.float32)
+
+
+def _build_water_enforcement_mask(terrain: TerrainGenerator, plan: dict) -> np.ndarray:
+    mask = np.zeros((terrain.height, terrain.width), dtype=np.float32)
+    for inland_sea in plan.get("inland_seas") or []:
+        mask = np.maximum(
+            mask,
+            _plan_inland_sea_component(
+                terrain,
+                str(inland_sea.get("position", "center")),
+                str(inland_sea.get("connection", "strait")),
+            ),
+        )
+
+    for water_body in plan.get("water_bodies") or []:
+        mask = np.maximum(
+            mask,
+            _plan_water_body_component(
+                terrain,
+                body_type=str(water_body.get("type", "ocean")),
+                position=str(water_body.get("position", "center")),
+                coverage=float(water_body.get("coverage", 0.25)),
+                connection=str(water_body.get("connection", "")),
+            ),
+        )
+
+    for relation in plan.get("regional_relations") or []:
+        if str(relation.get("relation", "")).lower() == "separated_by_water":
+            mask = np.maximum(
+                mask,
+                _separation_channel(
+                    terrain,
+                    str(relation.get("subject", "west")),
+                    str(relation.get("object", "east")),
+                    float(np.clip(relation.get("strength", 1.0), 0.1, 1.2)),
+                ),
+            )
+    return gaussian_smooth(mask)
+
+
+def _apply_water_enforcement(terrain: TerrainGenerator, elevation: np.ndarray, plan: dict) -> np.ndarray:
+    mask = _build_water_enforcement_mask(terrain, plan)
+    if not np.any(mask > 0.02):
+        return elevation
+
+    shaped = elevation.astype(np.float32).copy()
+    blend = np.clip(mask * 0.92, 0.0, 0.94)
+    water_target = (-0.42 - mask * 0.72).astype(np.float32)
+    shaped = shaped * (1.0 - blend) + water_target * blend
+    forced = mask >= 0.42
+    shaped[forced] = np.minimum(shaped[forced], (-0.22 - mask[forced] * 0.58).astype(np.float32))
+    return gaussian_smooth(shaped)
+
+
+def _enforce_required_water_gaps(terrain: TerrainGenerator, elevation: np.ndarray, plan: dict) -> np.ndarray:
+    profile = plan.get("profile") or {}
+    constraints = plan.get("constraints") or {}
+    continents = list(plan.get("continents") or constraints.get("continents") or [])
+    sea_zones = list(constraints.get("sea_zones") or [])
+    relations = list(plan.get("regional_relations") or [])
+    shaped = elevation.astype(np.float32).copy()
+
+    positions = {str(item.get("position", "")) for item in continents}
+    layout_template = str(profile.get("layout_template", "default"))
+    sea_style = str(profile.get("sea_style", "open"))
+
+    split_barrier = np.zeros_like(shaped)
+    if layout_template == "split_east_west" or _requires_opposite_side_split(relations, "west", "east"):
+        split_barrier = np.maximum(
+            split_barrier,
+            _axis_aligned_ocean_barrier(terrain, "vertical", center=0.5, width=0.075),
+        )
+        split_barrier = np.maximum(
+            split_barrier,
+            terrain._elliptic_gaussian(0.5, 0.5, 0.5, 0.095, 0.0),
+        )
+    elif layout_template == "split_north_south" or _requires_opposite_side_split(relations, "north", "south"):
+        split_barrier = np.maximum(
+            split_barrier,
+            _axis_aligned_ocean_barrier(terrain, "horizontal", center=0.5, width=0.075),
+        )
+        split_barrier = np.maximum(
+            split_barrier,
+            terrain._elliptic_gaussian(0.5, 0.5, 0.095, 0.5, 0.0),
+        )
+
+    if "center" in sea_zones and {"west", "east"} <= positions:
+        split_barrier = np.maximum(
+            split_barrier,
+            _axis_aligned_ocean_barrier(terrain, "vertical", center=0.5, width=0.08),
+        )
+    if "center" in sea_zones and {"north", "south"} <= positions and sea_style != "inland":
+        split_barrier = np.maximum(
+            split_barrier,
+            _axis_aligned_ocean_barrier(terrain, "horizontal", center=0.5, width=0.08),
+        )
+
+    inland_basin = np.zeros_like(shaped)
+    if sea_style == "inland" or layout_template == "mediterranean":
+        inland_basin = np.maximum(
+            inland_basin,
+            terrain._elliptic_gaussian(0.5, 0.5, 0.2, 0.32, 0.0),
+        )
+        inland_basin = np.maximum(
+            inland_basin,
+            terrain._elliptic_gaussian(0.5, 0.5, 0.13, 0.4, 0.0) * 0.9,
+        )
+        if {"north", "south"} <= positions:
+            inland_basin = np.maximum(
+                inland_basin,
+                terrain._elliptic_gaussian(0.5, 0.5, 0.16, 0.36, 0.0),
+            )
+
+    shaped = _force_water_mask(shaped, split_barrier, base_depth=-0.34, mask_threshold=0.52)
+    shaped = _force_water_mask(shaped, inland_basin, base_depth=-0.3, mask_threshold=0.44)
+    return shaped
+
+
+def _requires_opposite_side_split(relations: list[dict], a: str, b: str) -> bool:
+    for relation in relations:
+        if str(relation.get("relation", "")).lower() != "separated_by_water":
+            continue
+        subject = str(relation.get("subject", "")).lower()
+        object_name = str(relation.get("object", "")).lower()
+        if {subject, object_name} == {a, b}:
+            return True
+    return False
+
+
+def _force_water_mask(
+    elevation: np.ndarray,
+    mask: np.ndarray,
+    base_depth: float,
+    mask_threshold: float,
+) -> np.ndarray:
+    if not np.any(mask > 0.02):
+        return elevation
+
+    shaped = elevation.astype(np.float32).copy()
+    blend = np.clip(mask * 0.94, 0.0, 0.97)
+    target = (base_depth - mask * 0.5).astype(np.float32)
+    shaped = shaped * (1.0 - blend) + target * blend
+    forced = mask >= mask_threshold
+    shaped[forced] = np.minimum(shaped[forced], target[forced])
+    return shaped
 
 
 def _continent_component(

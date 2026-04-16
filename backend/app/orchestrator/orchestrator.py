@@ -60,7 +60,6 @@ def execute_generation(task_id: str) -> None:
         seed = _resolve_seed(task.task_id, task.params or {})
         plan_json = task.plan_json or {}
 
-    transition_task(task_id, TaskStatus.SIMULATING, progress=60, reason="render")
     arrays, preview = render_world(plan_json, width=width, height=height, seed=seed)
     repo.save_world(task_id, **arrays)
 
@@ -98,7 +97,6 @@ def queue_generation(task_id: str):
 
 def generate_tiles_for_task(task_id: str) -> None:
     preview = Image.open(BytesIO(repo.read_preview_bytes(task_id))).convert("RGB")
-    transition_task(task_id, TaskStatus.RENDERING_TILES, progress=100, reason="tiles", preview_ready=True)
     generate_tiles(task_id, repo, preview, max_zoom=settings.MAX_TILE_ZOOM)
     transition_task(
         task_id,

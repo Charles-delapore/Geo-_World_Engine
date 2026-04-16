@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
@@ -8,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.world_plan import GenerationModuleSpec
 from app.orchestrator.orchestrator import _resolve_seed, queue_generation, queue_orchestrator
 from app.orchestrator.state_machine import PUBLIC_STATUS
 from app.storage.artifact_repo import ArtifactRepository
@@ -22,6 +24,8 @@ class CreateMapRequest(BaseModel):
     width: int = Field(default_factory=lambda: settings.DEFAULT_WIDTH, ge=256, le=settings.MAX_WIDTH)
     height: int = Field(default_factory=lambda: settings.DEFAULT_HEIGHT, ge=256, le=settings.MAX_HEIGHT)
     seed: int | None = None
+    generation_backend: Literal["gaussian_voronoi", "modular"] | None = None
+    module_sequence: list[GenerationModuleSpec] = Field(default_factory=list)
     auto_confirm: bool = settings.DEFAULT_AUTO_CONFIRM
     generate_tiles: bool = settings.DEFAULT_GENERATE_TILES
     llm_api_key: str | None = None
@@ -61,6 +65,7 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
         "seed": _resolve_seed(task.task_id, params),
         "width": int(params.get("width", settings.DEFAULT_WIDTH)),
         "height": int(params.get("height", settings.DEFAULT_HEIGHT)),
+        "generationBackend": plan.get("generation_backend", "gaussian_voronoi"),
         "layoutTemplate": profile.get("layout_template", "default"),
         "seaStyle": profile.get("sea_style", "open"),
         "landRatio": float(profile.get("land_ratio", 0.44)),
@@ -73,6 +78,8 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
         "continentCount": len(constraints.get("continents") or []),
         "mountainCount": len(constraints.get("mountains") or []),
         "seaZoneCount": len(constraints.get("sea_zones") or []),
+        "waterBodyCount": len(plan.get("water_bodies") or []),
+        "regionalRelationCount": len(plan.get("regional_relations") or []),
         "ragEnabled": bool(rag_meta.get("enabled")),
         "ragExamples": int(rag_meta.get("retrieved_count", 0)),
         "ragTopSimilarity": rag_meta.get("top_similarity"),

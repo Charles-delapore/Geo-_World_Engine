@@ -3,14 +3,17 @@ from __future__ import annotations
 import logging
 
 from app.config import settings
-from app.core.llm_parser import get_constraints_summary, parse_with_rag
+from app.core.llm_parser import _build_module_sequence, get_constraints_summary, parse_with_rag
 from app.core.world_plan import (
     Continent,
     InlandSea,
     IslandChain,
     Mountain,
     Peninsula,
+    RegionalRelation,
     RiverHint,
+    WaterBody,
+    GenerationModuleSpec,
     WorldPlan,
 )
 from app.rag.init_kb import init_builtin_knowledge_base
@@ -46,6 +49,28 @@ def build_world_plan(prompt: str, params: dict) -> WorldPlan:
         base_url=params.get("llm_base_url") or settings.OPENAI_BASE_URL,
         model=params.get("llm_model") or settings.OPENAI_MODEL,
     )
+    requested_modules = list(params.get("module_sequence") or [])
+    requested_backend = str(params.get("generation_backend") or "").strip().lower()
+    if requested_modules and not requested_backend:
+        requested_backend = "modular"
+    if requested_backend in {"gaussian_voronoi", "modular"}:
+        parsed["generation_backend"] = requested_backend
+        if requested_backend == "gaussian_voronoi":
+            parsed["module_sequence"] = []
+        elif requested_modules:
+            parsed["module_sequence"] = requested_modules
+        elif not parsed.get("module_sequence"):
+            constraints_obj = parsed["constraints"]
+            profile_obj = parsed["profile"]
+            if isinstance(constraints_obj, dict):
+                from app.core.llm_parser import MapConstraints
+
+                constraints_obj = MapConstraints(**constraints_obj)
+            if isinstance(profile_obj, dict):
+                from app.core.llm_parser import WorldProfile
+
+                profile_obj = WorldProfile(**profile_obj)
+            parsed["module_sequence"] = _build_module_sequence(prompt, constraints_obj, profile_obj, requested_backend)
     constraints = parsed["constraints"] if isinstance(parsed["constraints"], dict) else parsed["constraints"].model_dump(mode="json")
     profile = parsed["profile"] if isinstance(parsed["profile"], dict) else parsed["profile"].model_dump(mode="json")
     plan = WorldPlan(
@@ -53,12 +78,16 @@ def build_world_plan(prompt: str, params: dict) -> WorldPlan:
         summary="",
         constraints=constraints,
         profile=profile,
+        generation_backend=str(parsed.get("generation_backend") or "gaussian_voronoi"),
         continents=[Continent(**item) for item in parsed.get("continents") or []],
         mountains=[Mountain(**item) for item in parsed.get("mountains") or []],
         island_chains=[IslandChain(**item) for item in parsed.get("island_chains") or []],
         peninsulas=[Peninsula(**item) for item in parsed.get("peninsulas") or []],
         inland_seas=[InlandSea(**item) for item in parsed.get("inland_seas") or []],
         river_hints=[RiverHint(**item) for item in parsed.get("river_hints") or []],
+        water_bodies=[WaterBody(**item) for item in parsed.get("water_bodies") or []],
+        regional_relations=[RegionalRelation(**item) for item in parsed.get("regional_relations") or []],
+        module_sequence=[GenerationModuleSpec(**item) for item in parsed.get("module_sequence") or []],
         climate_hints=list(parsed.get("climate_hints") or []),
         rag_meta=rag_meta,
     )
@@ -66,6 +95,8 @@ def build_world_plan(prompt: str, params: dict) -> WorldPlan:
     summary = get_constraints_summary(plan.constraints)
     summary = (
         f"{summary}\n"
+        f"Backend: {plan.generation_backend}, water_bodies={len(plan.water_bodies)}, "
+        f"regional_relations={len(plan.regional_relations)}, modules={len(plan.module_sequence)}\n"
         f"Profile: layout={plan.profile.layout_template}, land={plan.profile.land_ratio:.2f}, "
         f"sea={plan.profile.sea_style}, ruggedness={plan.profile.ruggedness:.2f}, coast={plan.profile.coast_complexity:.2f}, "
         f"moisture={plan.profile.moisture:.2f}, palette={plan.profile.palette_hint}\n"

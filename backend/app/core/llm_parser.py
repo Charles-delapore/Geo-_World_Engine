@@ -333,11 +333,14 @@ def parse_with_rag(
     model: str | None = None,
 ) -> dict:
     constraints = parse_constraints(user_prompt, api_key=api_key, base_url=base_url, model=model)
+    constraints = _enrich_constraints_from_sea_language(user_prompt, constraints)
     profile = infer_world_profile(user_prompt, constraints)
+    generation_backend = _select_generation_backend(user_prompt, profile)
 
     plan = {
         "constraints": constraints.model_dump(mode="json"),
         "profile": profile.model_dump(mode="json"),
+        "generation_backend": generation_backend,
         "continents": [{"position": item.position, "size": item.size} for item in constraints.continents],
         "mountains": [
             {"location": item.location, "height": item.height, "orientation": _infer_mountain_orientation(item.location)}
@@ -347,6 +350,9 @@ def parse_with_rag(
         "peninsulas": _extract_peninsulas(user_prompt),
         "inland_seas": _extract_inland_seas(user_prompt, constraints, profile),
         "river_hints": [{"region": region, "length": "long"} for region in constraints.river_sources],
+        "water_bodies": _extract_water_bodies(constraints, profile),
+        "regional_relations": _extract_regional_relations(user_prompt, constraints),
+        "module_sequence": _build_module_sequence(user_prompt, constraints, profile, generation_backend),
         "climate_hints": _build_climate_hints(profile),
     }
     if examples:
@@ -354,6 +360,70 @@ def parse_with_rag(
     plan["constraints"] = _sync_constraints_from_plan(plan, constraints).model_dump(mode="json")
     plan["profile"] = _sync_profile_from_plan(user_prompt, plan, profile).model_dump(mode="json")
     return plan
+
+
+def _enrich_constraints_from_sea_language(user_prompt: str, constraints: MapConstraints) -> MapConstraints:
+    lower = _normalize_prompt(user_prompt)
+    enriched = normalize_constraints(constraints)
+    continents = list(enriched.continents)
+    positions = {item.position for item in continents}
+
+    has_inland = _contains_any(lower, ["inland sea", "inner sea", "enclosed sea", "内海", "内陆海"])
+    has_middle_separator = _contains_any(
+        lower,
+        [
+            "separated by sea",
+            "sea between",
+            "ocean between",
+            "through the middle",
+            "middle sea",
+            "海隔开",
+            "被海隔开",
+            "中间被海隔开",
+        ],
+    )
+    has_north_south_enclosure = _contains_any(
+        lower,
+        [
+            "north and south",
+            "to the north and south",
+            "land to the north and south",
+            "north and south sides",
+            "南北两侧",
+            "北部和南部",
+        ],
+    )
+    has_east_west_split = _contains_any(
+        lower,
+        [
+            "east and west",
+            "west and east",
+            "eastern and western",
+            "东西两侧",
+            "东部和西部",
+        ],
+    )
+
+    if has_middle_separator or (has_east_west_split and _contains_any(lower, SEA_TERMS)):
+        if len(continents) < 2 or positions == {"center"}:
+            enriched.continents = [
+                ContinentConstraint(position="west", size=0.28),
+                ContinentConstraint(position="east", size=0.28),
+            ]
+        if "center" not in enriched.sea_zones:
+            enriched.sea_zones.append("center")
+
+    if has_inland:
+        if has_north_south_enclosure or not enriched.continents or {item.position for item in enriched.continents} == {"center"}:
+            enriched.continents = [
+                ContinentConstraint(position="north", size=0.28),
+                ContinentConstraint(position="south", size=0.28),
+            ]
+        if "center" not in enriched.sea_zones:
+            enriched.sea_zones.append("center")
+
+    enriched.sea_zones = _dedupe(enriched.sea_zones)
+    return normalize_constraints(enriched)
 
 
 def _extract_positions(prompt: str) -> List[str]:
@@ -415,6 +485,152 @@ def _build_climate_hints(profile: WorldProfile) -> list[str]:
     elif profile.moisture >= 1.25:
         hints.append("wet")
     return _dedupe([hint for hint in hints if hint and hint != "default"])
+
+
+def _select_generation_backend(user_prompt: str, profile: WorldProfile) -> str:
+    normalized = _normalize_prompt(user_prompt)
+    modular_terms = [
+        "模块化",
+        "程序化",
+        "modular",
+        "procedural",
+        "terrace",
+        "terraced",
+        "plateau",
+        "mesa",
+        "台地",
+        "阶梯",
+        "阶地",
+    ]
+    if _contains_any(normalized, modular_terms):
+        return "modular"
+    if profile.layout_template in {"single_island", "archipelago"} and _contains_any(normalized, ["ridge", "山脊", "脊线", "plateau", "台地"]):
+        return "modular"
+    return "gaussian_voronoi"
+
+
+def _build_module_sequence(
+    user_prompt: str,
+    constraints: MapConstraints,
+    profile: WorldProfile,
+    generation_backend: str,
+) -> list[dict]:
+    if generation_backend != "modular":
+        return []
+
+    normalized = _normalize_prompt(user_prompt)
+    sequence: list[dict] = [
+        {"module": "noise", "params": {"scale": 175.0, "octaves": 4, "amplitude": 0.16, "operation": "add"}},
+        {"module": "ridged_noise", "params": {"scale": 68.0, "octaves": 4, "amplitude": 0.14, "operation": "add"}},
+    ]
+
+    for continent in constraints.continents:
+        sequence.append(
+            {
+                "module": "continent",
+                "params": {
+                    "position": continent.position,
+                    "size": continent.size,
+                    "height": 0.88,
+                    "operation": "add",
+                },
+            }
+        )
+
+    for mountain in constraints.mountains:
+        sequence.append(
+            {
+                "module": "gaussian_mountain",
+                "params": {
+                    "location": mountain.location,
+                    "height": mountain.height,
+                    "sigma": 0.12,
+                    "operation": "add",
+                },
+            }
+        )
+        sequence.append(
+            {
+                "module": "ridge",
+                "params": {
+                    "location": mountain.location,
+                    "height": mountain.height,
+                    "operation": "add",
+                },
+            }
+        )
+
+    if _contains_any(normalized, ["台地", "高原", "plateau", "mesa", "terrace", "阶梯"]):
+        plateau_position = constraints.mountains[0].location if constraints.mountains else (constraints.continents[0].position if constraints.continents else "center")
+        sequence.append(
+            {
+                "module": "plateau",
+                "params": {
+                    "position": plateau_position,
+                    "height": 0.2,
+                    "radius_y": 0.14,
+                    "radius_x": 0.24,
+                    "operation": "add",
+                },
+            }
+        )
+
+    for water_body in _extract_water_bodies(constraints, profile):
+        body_type = str(water_body.get("type", "ocean")).lower()
+        sequence.append(
+            {
+                "module": "strait" if "strait" in body_type else "water_body",
+                "params": {
+                    "position": water_body.get("position", "center"),
+                    "coverage": water_body.get("coverage", 0.2),
+                    "depth": 0.8,
+                    "connection": water_body.get("connection"),
+                    "operation": "subtract",
+                },
+            }
+        )
+
+    sequence.append({"module": "smooth", "params": {"sigma": 1.4, "operation": "replace"}})
+    return sequence
+
+
+def _extract_water_bodies(constraints: MapConstraints, profile: WorldProfile) -> list[dict]:
+    water_bodies: list[dict] = []
+    if profile.sea_style == "open" and constraints.sea_zones:
+        for zone in constraints.sea_zones:
+            water_bodies.append({"type": "ocean", "position": zone, "coverage": 0.4})
+    elif profile.sea_style == "inland":
+        for zone in constraints.sea_zones or ["center"]:
+            water_bodies.append({"type": "inland_sea", "position": zone, "coverage": 0.2, "connection": "strait"})
+    elif profile.sea_style == "strait":
+        for zone in constraints.sea_zones or ["center"]:
+            water_bodies.append({"type": "strait", "position": zone, "coverage": 0.12, "connection": "open"})
+    return water_bodies
+
+
+def _extract_regional_relations(user_prompt: str, constraints: MapConstraints) -> list[dict]:
+    normalized = _normalize_prompt(user_prompt)
+    relations: list[dict] = []
+    if len(constraints.continents) >= 2 and _contains_any(normalized, ["隔开", "分隔", "between", "separate", "split"]):
+        ordered = constraints.continents[:2]
+        relations.append(
+            {
+                "relation": "separated_by_water",
+                "subject": ordered[0].position,
+                "object": ordered[1].position,
+                "strength": 0.92,
+            }
+        )
+    for mountain in constraints.mountains:
+        relations.append(
+            {
+                "relation": "elevated_region",
+                "subject": mountain.location,
+                "object": "mountain_chain",
+                "strength": float(np.clip(mountain.height, 0.2, 1.0)),
+            }
+        )
+    return relations
 
 
 def _merge_rag_examples(user_prompt: str, plan: dict, examples: list[dict]) -> dict:
