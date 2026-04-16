@@ -21,6 +21,7 @@ const metrics = computed(() => {
 
   return [
     { label: '版型', value: diagnostics.layoutTemplate },
+    { label: '海域类型', value: diagnostics.seaStyle },
     { label: '大陆数', value: String(diagnostics.continentCount) },
     { label: '山脉约束', value: String(diagnostics.mountainCount) },
     { label: '海域约束', value: String(diagnostics.seaZoneCount) },
@@ -31,6 +32,10 @@ const metrics = computed(() => {
     { label: '湿润度', value: diagnostics.moisture.toFixed(2) },
     { label: '温度偏置', value: diagnostics.temperatureBias.toFixed(1) },
     { label: '主导风向', value: diagnostics.windDirection },
+    { label: 'RAG启用', value: diagnostics.ragEnabled ? 'yes' : 'no' },
+    { label: '示例命中', value: String(diagnostics.ragExamples) },
+    { label: '最高相似度', value: diagnostics.ragTopSimilarity == null ? '-' : diagnostics.ragTopSimilarity.toFixed(3) },
+    { label: '回退原因', value: diagnostics.ragFallbackReason ?? '-' },
     { label: '分辨率', value: `${diagnostics.width}×${diagnostics.height}` },
   ]
 })

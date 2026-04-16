@@ -55,6 +55,7 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
     plan = task.plan_json or {}
     profile = plan.get("profile") or {}
     constraints = plan.get("constraints") or {}
+    rag_meta = plan.get("rag_meta") or {}
     params = task.params or {}
     diagnostics = {
         "seed": _resolve_seed(task.task_id, params),
@@ -72,6 +73,10 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
         "continentCount": len(constraints.get("continents") or []),
         "mountainCount": len(constraints.get("mountains") or []),
         "seaZoneCount": len(constraints.get("sea_zones") or []),
+        "ragEnabled": bool(rag_meta.get("enabled")),
+        "ragExamples": int(rag_meta.get("retrieved_count", 0)),
+        "ragTopSimilarity": rag_meta.get("top_similarity"),
+        "ragFallbackReason": rag_meta.get("fallback_reason"),
     }
     return MapResource(
         taskId=task.task_id,

@@ -1,108 +1,127 @@
-
-=======
-
-# Geo_World_Engine
-Geo-WorldEngine(Beta) 是一个调试中的AI驱动程序化幻想地图生成系统。融合LLM语义理解、计算几何、物理模拟和分布式任务调度,支持自然语言约束的交互式世界构建。
-这个项目仍然在草创阶段，而且大部分工作由agent完成（我指的是codex），后续将会持续优化。【welcome stars and contributions!】
-=======
-
 # Geo-WorldEngine Beta
 
-Geo-WorldEngine Beta is the beta-generation workspace for the world map pipeline. It currently includes:
+Geo-WorldEngine Beta 是当前的世界生成实验工作区。它包含：
 
-- FastAPI backend with a unified `/api/maps/{taskId}` task resource model
-- Vue 3 + Vite frontend for task submission, polling, preview display, and interactive map switching
-- Local development mode for rapid iteration
-- Containerized deployment baseline with PostgreSQL, Redis, MinIO, Celery, and Nginx
+- FastAPI 后端，统一使用 `/api/maps/{taskId}` 任务资源模型
+- Vue 3 + Vite 前端，负责提交 prompt、轮询状态、展示预览图与交互地图
+- 本地开发模式
+- 容器化部署基线
+- 新的 RAG 解析增强模块，用于改进 `自然语言 -> WorldPlan`
 
-## Repository Safety
+## 安全
 
-This repository is prepared for public or shared version control with a conservative ignore policy:
+仓库已按公开版本控制做了保守处理：
 
-- local secrets are excluded through `.gitignore`
-- generated preview images, tiles, databases, and Docker volume data are excluded
-- virtual environments, caches, editor folders, logs, and local temp files are excluded
+- `.env`、本地密钥、数据库、产物目录、日志、缓存、虚拟环境默认忽略
+- 发布前仍应手动确认没有把真实 API key、用户 prompt 导出、调试转储写进未忽略路径
 
-Before publishing, verify that no real API keys, user prompts, exported datasets, or local debug dumps were manually added outside the ignored paths.
+## 目录
 
-## Project Layout
+- `backend/`: FastAPI、任务编排、workers、RAG、存储适配器
+- `frontend/Geo-world/`: 前端
+- `deployment/`: Compose 与辅助脚本
+- `start-beta.ps1`: 本地开发启动脚本
+- `.env.example`: 环境变量模板
 
-- `backend/`: FastAPI app, orchestration, workers, storage adapters, Alembic migrations
-- `frontend/Geo-world/`: Vite + Vue frontend
-- `frontend/nginx.conf`: production reverse proxy configuration
-- `deployment/`: Compose files and helper scripts
-- `start-beta.ps1`: local development launcher
-- `.env.example`: safe template for required environment variables
+## 本地开发
 
-## Local Development
-
-Prerequisites:
+前置：
 
 - Python 3.13
-- Node.js with npm
+- Node.js + npm
 
-Start both local services:
+启动：
 
 ```powershell
 Set-Location .\GEO
 .\start-beta.ps1
 ```
 
-Default local addresses:
+默认地址：
 
-- frontend: `http://127.0.0.1:5173`
-- backend: `http://127.0.0.1:8000`
+- 前端：`http://127.0.0.1:5173`
+- 后端：`http://127.0.0.1:8000`
 
-The Vite dev server proxies `/api` to the backend so preview images and tile assets resolve correctly in local mode.
+## RAG 模块
 
-## Containerized Deployment
+beta 现在集成了 P0 版本的只读 RAG：
 
-The repository also includes a containerized beta baseline.
+- 只增强 `自然语言 -> WorldPlan`
+- 不替代地形生成器
+- 启动时自动初始化内置 recipe 库
+- planner 会记录 `rag_meta`
+- 前端任务状态面板会显示：
+  - 是否启用 RAG
+  - 命中的示例数
+  - 最高相似度
+  - 回退原因
 
-Core services:
+相关代码：
 
-- `backend-api`
-- `celery-worker`
-- `celery-tile`
-- `postgres`
-- `redis`
-- `minio`
-- `frontend`
+- `backend/app/rag/`
+- `backend/tests/fixtures/rag_eval_set.json`
+- `backend/scripts/calibrate_rag_thresholds.py`
 
-Setup:
+### 环境变量
 
-1. Copy `.env.example` to `.env`
-2. Review the values and replace placeholders
-3. Start the stack with the compose file in `deployment/`
+`.env.example` 里新增了：
 
-Current deployment behavior:
+- `ENABLE_RAG`
+- `RECIPE_DB_URL`
+- `RAG_MIN_SIMILARITY`
+- `RAG_SECOND_DIFF_THRESHOLD`
+- `RAG_TOP_K`
+- `RAG_LOG_LEVEL`
 
-- backend API container performs database bootstrap on startup
-- readiness checks validate database connectivity and, in distributed mode, Redis and artifact storage
-- Nginx resolves backend service names through Docker DNS to avoid stale upstream IPs after container recreation
-- backend containers disable Numba JIT by default to avoid Python 3.13 container cache failures during generation
+### 初始化内置知识库
 
-## Current Beta Scope
+通常在后端启动时自动执行。如果需要手动初始化：
 
-Implemented baseline features:
+```powershell
+Set-Location .\backend
+..\.venv313\Scripts\python.exe -m app.rag.init_kb
+```
 
-- task creation and polling
-- task status progression
-- static preview generation
-- interactive tile manifest generation
-- separate default worker and tile worker queues
-- PostgreSQL/Redis/MinIO-ready deployment structure
+如果上面路径不方便，直接用你本机的 Python 3.13 虚拟环境执行同一命令即可。
 
-Known limitations at this stage:
+### 阈值校准
 
-- generated geography may still diverge from prompt intent
-- world preview fidelity and semantic alignment need further tuning
-- interactive map currently uses the generated raster tile output, not a richer vector map stack
+RAG 默认阈值只是起点，不应当视为最终值。当前仓库已附带一个最小评测集和校准脚本：
 
-## Recommended Next Work
+```powershell
+Set-Location .\backend
+..\.venv313\Scripts\python.exe .\scripts\calibrate_rag_thresholds.py
+```
 
-- improve prompt-to-world semantic alignment
-- refine terrain, climate, and biome rendering quality
-- add structured logging, metrics, and retry policy controls
-- tighten production deployment assumptions around PostgreSQL-only execution
+输出会给出：
 
+- 相似度分布
+- Top-1 / Top-2 差值分布
+- 推荐的 `RAG_MIN_SIMILARITY`
+
+当前随仓库提交的默认值已经按这套最小评测集校过一轮：
+
+- `RAG_MIN_SIMILARITY=0.50`
+- `RAG_SECOND_DIFF_THRESHOLD=0.10`
+
+## 当前范围
+
+已具备：
+
+- 任务创建与轮询
+- 静态预览图生成
+- 交互瓦片 manifest
+- RAG 增强的 WorldPlan 解析
+- 任务资源中的解析诊断信息
+
+仍待继续：
+
+- 扩充 recipe 库
+- 基于真实评测集校准阈值
+- 将 RAG 命中的结构化 plan 更深地接入底层大陆骨架生成
+- 改善地图形态真实性
+
+## 容器化部署
+
+仓库保留了 `postgres + redis + minio + celery + nginx` 的部署基线。  
+如果要用容器部署，先复制 `.env.example` 到 `.env`，再用 `deployment/` 下的 compose 文件启动。

@@ -8,6 +8,7 @@ from app.api.routes.health import health as api_health
 from app.api.routes.health import ready as api_ready
 from app.api.routes import router
 from app.config import settings
+from app.rag.init_kb import init_builtin_knowledge_base
 from app.storage.models import init_db, session_scope
 
 
@@ -28,6 +29,8 @@ def startup() -> None:
         init_db()
         with session_scope() as db:
             db.execute(text("SELECT 1"))
+    if settings.ENABLE_RAG:
+        init_builtin_knowledge_base(force=False)
 
 
 @app.get("/")

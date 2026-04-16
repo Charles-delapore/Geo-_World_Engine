@@ -12,6 +12,7 @@ export interface MapDiagnostics {
   width: number
   height: number
   layoutTemplate: string
+  seaStyle: string
   landRatio: number
   ruggedness: number
   coastComplexity: number
@@ -22,6 +23,10 @@ export interface MapDiagnostics {
   continentCount: number
   mountainCount: number
   seaZoneCount: number
+  ragEnabled: boolean
+  ragExamples: number
+  ragTopSimilarity: number | null
+  ragFallbackReason: string | null
 }
 
 export interface MapTask {

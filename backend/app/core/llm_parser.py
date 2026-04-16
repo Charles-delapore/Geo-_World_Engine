@@ -325,6 +325,37 @@ def infer_world_profile(prompt: str, constraints: MapConstraints) -> WorldProfil
     return profile
 
 
+def parse_with_rag(
+    user_prompt: str,
+    examples: list[dict] | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> dict:
+    constraints = parse_constraints(user_prompt, api_key=api_key, base_url=base_url, model=model)
+    profile = infer_world_profile(user_prompt, constraints)
+
+    plan = {
+        "constraints": constraints.model_dump(mode="json"),
+        "profile": profile.model_dump(mode="json"),
+        "continents": [{"position": item.position, "size": item.size} for item in constraints.continents],
+        "mountains": [
+            {"location": item.location, "height": item.height, "orientation": _infer_mountain_orientation(item.location)}
+            for item in constraints.mountains
+        ],
+        "island_chains": _extract_island_chains(user_prompt),
+        "peninsulas": _extract_peninsulas(user_prompt),
+        "inland_seas": _extract_inland_seas(user_prompt, constraints, profile),
+        "river_hints": [{"region": region, "length": "long"} for region in constraints.river_sources],
+        "climate_hints": _build_climate_hints(profile),
+    }
+    if examples:
+        plan = _merge_rag_examples(user_prompt, plan, examples)
+    plan["constraints"] = _sync_constraints_from_plan(plan, constraints).model_dump(mode="json")
+    plan["profile"] = _sync_profile_from_plan(user_prompt, plan, profile).model_dump(mode="json")
+    return plan
+
+
 def _extract_positions(prompt: str) -> List[str]:
     normalized = _normalize_prompt(prompt)
     results: List[str] = []
@@ -335,6 +366,144 @@ def _extract_positions(prompt: str) -> List[str]:
         if any(_alias_matches(normalized, alias) for alias in aliases):
             results.append(canonical)
     return _dedupe(results)
+
+
+def _infer_mountain_orientation(location: str) -> str | None:
+    normalized = _canonicalize_position(location)
+    if normalized in {"north", "south"}:
+        return "east-west"
+    if normalized in {"east", "west"}:
+        return "north-south"
+    if normalized in {"northwest", "northeast", "southwest", "southeast"}:
+        return "arc"
+    return None
+
+
+def _extract_island_chains(prompt: str) -> list[dict]:
+    normalized = _normalize_prompt(prompt)
+    if _contains_any(normalized, ["archipelago", "island chain", "群岛", "列岛", "岛链"]):
+        positions = _extract_positions(prompt)
+        return [{"position": position, "density": 0.66} for position in (positions[:2] or ["center"])]
+    return []
+
+
+def _extract_peninsulas(prompt: str) -> list[dict]:
+    normalized = _normalize_prompt(prompt)
+    if not _contains_any(normalized, ["peninsula", "半岛"]):
+        return []
+    positions = _extract_positions(prompt)
+    return [{"location": position, "size": 0.18} for position in (positions[:1] or ["west"])]
+
+
+def _extract_inland_seas(prompt: str, constraints: MapConstraints, profile: WorldProfile) -> list[dict]:
+    normalized = _normalize_prompt(prompt)
+    if profile.sea_style != "inland" and not _contains_any(normalized, ["内海", "inner sea", "inland sea", "内陆海"]):
+        return []
+    position = (constraints.sea_zones[:1] or ["center"])[0]
+    connection = "strait" if _contains_any(normalized, ["海峡", "strait"]) else "east ocean"
+    return [{"position": position, "connection": connection}]
+
+
+def _build_climate_hints(profile: WorldProfile) -> list[str]:
+    hints = [profile.palette_hint, profile.layout_template, profile.sea_style]
+    if profile.temperature_bias <= -4:
+        hints.append("cold")
+    elif profile.temperature_bias >= 4:
+        hints.append("warm")
+    if profile.moisture <= 0.7:
+        hints.append("dry")
+    elif profile.moisture >= 1.25:
+        hints.append("wet")
+    return _dedupe([hint for hint in hints if hint and hint != "default"])
+
+
+def _merge_rag_examples(user_prompt: str, plan: dict, examples: list[dict]) -> dict:
+    normalized = _normalize_prompt(user_prompt)
+    merged = {**plan}
+    for example in examples:
+        world_plan = example.get("world_plan") or {}
+        example_profile = world_plan.get("profile") or {}
+        example_layout = example_profile.get("layout_template")
+        example_sea_style = example_profile.get("sea_style")
+
+        wants_inland = _contains_any(normalized, ["内海", "inner sea", "inland sea", "内陆海"])
+        wants_open = _contains_any(normalized, ["隔着海", "被海隔开", "sea between", "ocean between", "开阔海洋", "外海"])
+        wants_peninsula = _contains_any(normalized, ["半岛", "peninsula"])
+        wants_archipelago = _contains_any(normalized, ["群岛", "archipelago", "岛链"])
+        wants_island = _contains_any(normalized, ["四面环海", "surrounded by sea", "island continent", "环海大陆"])
+        wants_mountains = _contains_any(normalized, MOUNTAIN_TERMS)
+
+        if wants_inland and world_plan.get("inland_seas") and example_sea_style == "inland":
+            merged["inland_seas"] = world_plan.get("inland_seas") or merged["inland_seas"]
+            merged["continents"] = world_plan.get("continents") or merged["continents"]
+            merged["profile"]["layout_template"] = example_layout or "mediterranean"
+            merged["profile"]["sea_style"] = "inland"
+        if wants_open and example_sea_style == "open":
+            merged["inland_seas"] = []
+            if example_layout in {"split_east_west", "split_north_south"}:
+                merged["continents"] = world_plan.get("continents") or merged["continents"]
+                merged["profile"]["layout_template"] = example_layout
+            merged["profile"]["sea_style"] = "open"
+        if wants_peninsula and world_plan.get("peninsulas"):
+            merged["peninsulas"] = world_plan.get("peninsulas") or merged["peninsulas"]
+        if wants_archipelago and world_plan.get("island_chains"):
+            merged["island_chains"] = world_plan.get("island_chains") or merged["island_chains"]
+            if example_layout:
+                merged["profile"]["layout_template"] = example_layout
+        if wants_island and example_layout == "single_island":
+            merged["continents"] = world_plan.get("continents") or merged["continents"]
+            merged["peninsulas"] = world_plan.get("peninsulas") or merged["peninsulas"]
+            merged["profile"]["layout_template"] = "single_island"
+            merged["profile"]["sea_style"] = "open"
+        if wants_mountains and world_plan.get("mountains"):
+            requested_positions = {item["location"] for item in merged["mountains"] if item.get("location")}
+            candidate_positions = {item["location"] for item in world_plan.get("mountains") or [] if item.get("location")}
+            if not requested_positions or requested_positions & candidate_positions:
+                merged["mountains"] = world_plan.get("mountains") or merged["mountains"]
+
+        if world_plan.get("river_hints") and not merged["river_hints"]:
+            merged["river_hints"] = world_plan.get("river_hints") or merged["river_hints"]
+    merged["climate_hints"] = _dedupe((merged.get("climate_hints") or []) + _build_climate_hints(WorldProfile(**merged["profile"])))
+    return merged
+
+
+def _sync_constraints_from_plan(plan: dict, fallback: MapConstraints) -> MapConstraints:
+    constraints = MapConstraints(
+        continents=[
+            ContinentConstraint(position=item["position"], size=float(item.get("size", 0.3)))
+            for item in plan.get("continents") or []
+        ],
+        mountains=[
+            MountainConstraint(location=item["location"], height=float(item.get("height", 0.7)))
+            for item in plan.get("mountains") or []
+        ],
+        sea_zones=[item["position"] for item in plan.get("inland_seas") or []],
+        river_sources=[item["region"] for item in plan.get("river_hints") or []],
+    )
+    normalized = normalize_constraints(constraints)
+    if not normalized.continents and fallback.continents:
+        normalized.continents = fallback.continents
+    if not normalized.mountains and fallback.mountains:
+        normalized.mountains = fallback.mountains
+    if not normalized.sea_zones and fallback.sea_zones:
+        normalized.sea_zones = fallback.sea_zones
+    if not normalized.river_sources and fallback.river_sources:
+        normalized.river_sources = fallback.river_sources
+    return normalized
+
+
+def _sync_profile_from_plan(user_prompt: str, plan: dict, fallback: WorldProfile) -> WorldProfile:
+    constraints = _sync_constraints_from_plan(plan, normalize_constraints(MapConstraints()))
+    profile = infer_world_profile(user_prompt, constraints)
+    merged = fallback.model_dump(mode="json")
+    merged.update(plan.get("profile") or {})
+    merged.update(
+        {
+            "layout_template": merged.get("layout_template") or profile.layout_template,
+            "sea_style": merged.get("sea_style") or profile.sea_style,
+        }
+    )
+    return WorldProfile(**merged)
 
 
 def _extract_continent_positions(prompt: str, positions: List[str]) -> List[str]:

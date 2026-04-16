@@ -42,9 +42,17 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     OPENAI_BASE_URL: str | None = None
     OPENAI_MODEL: str = "gpt-4o-mini"
+    ENABLE_RAG: bool = True
+    CHROMA_PERSIST_DIR: Path = DATA_DIR / "chroma"
+    RECIPE_DB_URL: str = f"sqlite:///{(DATA_DIR / 'recipes.db').as_posix()}"
+    RAG_MIN_SIMILARITY: float = 0.50
+    RAG_SECOND_DIFF_THRESHOLD: float = 0.10
+    RAG_TOP_K: int = 2
+    RAG_LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["*"])
 
 
 settings = Settings()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+settings.CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)

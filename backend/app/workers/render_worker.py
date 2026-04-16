@@ -13,7 +13,7 @@ def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[s
 
     constraints = (plan or {}).get("constraints") or {}
     profile = (plan or {}).get("profile") or {}
-    elevation, uses_hard_topology = _shape_world_profile(terrain, elevation, profile, constraints)
+    elevation, uses_hard_topology = _shape_world_profile(terrain, elevation, plan or {})
     if constraints:
         refinement_constraints = _constraints_for_refinement(constraints, profile, uses_hard_topology)
         if refinement_constraints:
@@ -38,7 +38,9 @@ def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[s
     return arrays, preview
 
 
-def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, profile: dict, constraints: dict) -> tuple[np.ndarray, bool]:
+def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, plan: dict) -> tuple[np.ndarray, bool]:
+    profile = plan.get("profile") or {}
+    constraints = plan.get("constraints") or {}
     land_ratio = float(profile.get("land_ratio", 0.44))
     ruggedness = float(profile.get("ruggedness", 0.55))
     coast_complexity = float(profile.get("coast_complexity", 0.5))
@@ -51,7 +53,7 @@ def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, profi
     archipelago = terrain._fbm(scale=64.0, octaves=4, persistence=0.52, lacunarity=2.15, offset=91.0)
     coastline_noise = terrain._fbm(scale=88.0, octaves=3, persistence=0.58, lacunarity=2.05, offset=143.0)
 
-    hard_topology = _build_hard_topology(terrain, layout_template, sea_style, constraints, ruggedness)
+    hard_topology = _build_hard_topology(terrain, layout_template, sea_style, plan, ruggedness)
     uses_hard_topology = hard_topology is not None
 
     shaped = elevation.astype(np.float32)
@@ -199,16 +201,71 @@ def _build_hard_topology(
     terrain: TerrainGenerator,
     layout_template: str,
     sea_style: str,
-    constraints: dict,
+    plan: dict,
     ruggedness: float,
 ) -> np.ndarray | None:
+    constraints = plan.get("constraints") or {}
+    explicit = _build_plan_structural_topology(terrain, plan, ruggedness)
+
+    layout_field: np.ndarray | None = None
     if layout_template == "split_east_west":
-        return _build_split_east_west_topology(terrain, constraints, ruggedness)
-    if layout_template == "mediterranean" or sea_style == "inland":
-        return _build_inland_sea_topology(terrain, constraints, ruggedness)
-    if layout_template == "single_island":
-        return _build_single_island_topology(terrain, constraints, ruggedness)
-    return None
+        layout_field = _build_split_east_west_topology(terrain, constraints, ruggedness)
+    elif layout_template == "mediterranean" or sea_style == "inland":
+        layout_field = _build_inland_sea_topology(terrain, constraints, ruggedness)
+    elif layout_template == "single_island":
+        layout_field = _build_single_island_topology(terrain, constraints, ruggedness)
+
+    if explicit is not None and layout_field is not None:
+        return _normalize_topology(layout_field * 0.4 + explicit * 0.6)
+    return explicit if explicit is not None else layout_field
+
+
+def _build_plan_structural_topology(terrain: TerrainGenerator, plan: dict, ruggedness: float) -> np.ndarray | None:
+    continents = list(plan.get("continents") or [])
+    mountains = list(plan.get("mountains") or [])
+    peninsulas = list(plan.get("peninsulas") or [])
+    island_chains = list(plan.get("island_chains") or [])
+    inland_seas = list(plan.get("inland_seas") or [])
+    constraints = plan.get("constraints") or {}
+
+    if not any([continents, mountains, peninsulas, island_chains, inland_seas]):
+        return None
+
+    field = np.full((terrain.height, terrain.width), -0.45, dtype=np.float32)
+
+    if continents:
+        continent_masks = []
+        for continent in continents:
+            position = str(continent.get("position", "center"))
+            size = float(continent.get("size", 0.38))
+            component = _plan_continent_component(terrain, position, size)
+            continent_masks.append(component)
+            field += component * 1.25
+        field += np.maximum.reduce(continent_masks) * 0.28
+
+    for chain in island_chains:
+        field += _plan_island_chain_component(
+            terrain,
+            str(chain.get("position", "center")),
+            float(chain.get("density", 0.66)),
+        ) * 0.9
+
+    for peninsula in peninsulas:
+        field += _plan_peninsula_component(
+            terrain,
+            str(peninsula.get("location", "west")),
+            float(peninsula.get("size", 0.18)),
+        ) * 1.05
+
+    for inland_sea in inland_seas:
+        field -= _plan_inland_sea_component(
+            terrain,
+            str(inland_sea.get("position", "center")),
+            str(inland_sea.get("connection", "strait")),
+        ) * 1.35
+
+    field = _apply_mountain_topology(terrain, field, {"mountains": mountains or constraints.get("mountains") or []}, ruggedness)
+    return _normalize_topology(field)
 
 
 def _build_split_east_west_topology(terrain: TerrainGenerator, constraints: dict, ruggedness: float) -> np.ndarray:
@@ -260,6 +317,88 @@ def _build_single_island_topology(terrain: TerrainGenerator, constraints: dict, 
     field = core * 1.22 - bays
     field = _apply_mountain_topology(terrain, field, constraints, ruggedness)
     return _normalize_topology(field)
+
+
+def _plan_continent_component(terrain: TerrainGenerator, position: str, size: float) -> np.ndarray:
+    size = float(np.clip(size, 0.18, 0.72))
+    base = terrain._create_continent_mask(position, size)
+    satellites = [_plan_satellite_mask(terrain, sat_position, size, weight) for sat_position, weight in _satellite_positions(position)]
+    coastline_noise = terrain._fbm(scale=58.0, octaves=3, persistence=0.56, lacunarity=2.05, offset=len(position) * 29.0)
+    combined = np.maximum.reduce([base, *satellites]) if satellites else base
+    combined = np.clip(combined * (0.86 + coastline_noise * 0.28), 0.0, 1.0)
+    return gaussian_smooth(combined)
+
+
+def _plan_satellite_mask(terrain: TerrainGenerator, position: str, size: float, weight: float) -> np.ndarray:
+    return terrain._create_continent_mask(position, max(0.12, size * weight)) * (0.55 + weight * 0.35)
+
+
+def _satellite_positions(position: str) -> list[tuple[str, float]]:
+    mapping = {
+        "west": [("northwest", 0.46), ("southwest", 0.5), ("center", 0.24)],
+        "east": [("northeast", 0.46), ("southeast", 0.5), ("center", 0.24)],
+        "north": [("northwest", 0.42), ("northeast", 0.42), ("center", 0.22)],
+        "south": [("southwest", 0.42), ("southeast", 0.42), ("center", 0.22)],
+        "northwest": [("west", 0.24), ("north", 0.24)],
+        "northeast": [("east", 0.24), ("north", 0.24)],
+        "southwest": [("west", 0.24), ("south", 0.24)],
+        "southeast": [("east", 0.24), ("south", 0.24)],
+        "center": [("west", 0.22), ("east", 0.22), ("south", 0.18)],
+    }
+    return mapping.get(position, [])
+
+
+def _plan_peninsula_component(terrain: TerrainGenerator, location: str, size: float) -> np.ndarray:
+    cy, cx = terrain._resolve_position(location)
+    rotation = terrain._position_rotation(location)
+    stem = terrain._elliptic_gaussian(cy, cx, max(0.12, size * 0.9), max(0.05, size * 0.42), rotation)
+    head = terrain._elliptic_gaussian(
+        np.clip(cy + np.sin(rotation) * size * 0.38, 0.06, 0.94),
+        np.clip(cx + np.cos(rotation) * size * 0.38, 0.04, 0.96),
+        max(0.08, size * 0.66),
+        max(0.04, size * 0.34),
+        rotation + 0.18,
+    )
+    return gaussian_smooth(np.maximum(stem, head * 0.92))
+
+
+def _plan_island_chain_component(terrain: TerrainGenerator, position: str, density: float) -> np.ndarray:
+    cy, cx = terrain._resolve_position(position)
+    orientation = terrain._position_rotation(position)
+    chain = np.zeros((terrain.height, terrain.width), dtype=np.float32)
+    count = int(np.clip(round(3 + density * 4), 3, 7))
+    for index in range(count):
+        offset = (index - (count - 1) / 2.0) * 0.075
+        iy = np.clip(cy + np.sin(orientation) * offset, 0.08, 0.92)
+        ix = np.clip(cx + np.cos(orientation) * offset, 0.04, 0.96)
+        island = terrain._elliptic_gaussian(iy, ix, 0.06 + density * 0.025, 0.038 + density * 0.016, orientation + (index % 2) * 0.35)
+        chain = np.maximum(chain, island.astype(np.float32))
+    return gaussian_smooth(chain)
+
+
+def _plan_inland_sea_component(terrain: TerrainGenerator, position: str, connection: str) -> np.ndarray:
+    cy, cx = terrain._resolve_position(position)
+    basin = np.maximum(
+        terrain._elliptic_gaussian(cy, cx, 0.16, 0.12, 0.0),
+        terrain._elliptic_gaussian(cy, cx, 0.11, 0.2, 0.0) * 0.84,
+    )
+    connection = (connection or "").lower()
+    if "strait" in connection:
+        basin = np.maximum(
+            basin,
+            terrain._elliptic_gaussian(cy, np.clip(cx + 0.18, 0.04, 0.96), 0.05, 0.03, 0.0) * 0.82,
+        )
+    elif "east" in connection:
+        basin = np.maximum(
+            basin,
+            terrain._elliptic_gaussian(cy, np.clip(cx + 0.22, 0.04, 0.96), 0.07, 0.045, 0.0) * 0.7,
+        )
+    elif "west" in connection:
+        basin = np.maximum(
+            basin,
+            terrain._elliptic_gaussian(cy, np.clip(cx - 0.22, 0.04, 0.96), 0.07, 0.045, 0.0) * 0.7,
+        )
+    return gaussian_smooth(basin)
 
 
 def _continent_component(
