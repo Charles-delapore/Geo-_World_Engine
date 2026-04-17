@@ -13,6 +13,23 @@ from app.workers.planner_worker import build_world_plan
 from app.workers.render_worker import render_world
 
 
+def _shoreline_span_std(mask: np.ndarray) -> float:
+    spans: list[float] = []
+    for row in mask:
+        cols = np.flatnonzero(row)
+        if cols.size >= 2:
+            spans.append(float(cols[-1] - cols[0]))
+    return float(np.std(spans)) if spans else 0.0
+
+
+def _mirrored_half_difference(mask: np.ndarray) -> float:
+    width = mask.shape[1]
+    half = width // 2
+    left = mask[:, :half]
+    right = np.fliplr(mask[:, width - half :])
+    return float(np.mean(left != right))
+
+
 def test_parse_with_rag_emits_beta_module_fields() -> None:
     plan = parse_with_rag("一东一西两个被海隔开的大陆，东北角有高山。")
 
@@ -111,10 +128,13 @@ def test_render_world_keeps_split_continents_separated_by_water() -> None:
     center_band = arrays["elevation"][:, 74:86]
     top_slice = arrays["elevation"][:28, 74:86]
     bottom_slice = arrays["elevation"][68:, 74:86]
+    central_window = arrays["elevation"][:, 58:102] < 0.0
 
     assert float(np.mean(center_band < 0.0)) > 0.78
     assert float(np.mean(top_slice < 0.0)) > 0.72
     assert float(np.mean(bottom_slice < 0.0)) > 0.72
+    assert _shoreline_span_std(central_window) > 1.2
+    assert _mirrored_half_difference(central_window) > 0.025
 
 
 def test_render_world_keeps_central_inland_sea_open() -> None:
@@ -145,9 +165,12 @@ def test_render_world_keeps_central_inland_sea_open() -> None:
     arrays, _ = render_world(plan, width=160, height=96, seed=17)
     central_basin = arrays["elevation"][32:64, 52:108]
     centerline = arrays["elevation"][38:58, 60:100]
+    basin_window = arrays["elevation"][24:72, 38:122].T < 0.0
 
     assert float(np.mean(central_basin < 0.0)) > 0.7
     assert float(np.mean(centerline < 0.0)) > 0.82
+    assert _shoreline_span_std(basin_window) > 1.2
+    assert _mirrored_half_difference(basin_window) > 0.06
 
 
 def test_render_world_supports_modular_backend() -> None:

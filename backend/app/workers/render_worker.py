@@ -590,53 +590,32 @@ def _enforce_required_water_gaps(terrain: TerrainGenerator, elevation: np.ndarra
 
     split_barrier = np.zeros_like(shaped)
     if layout_template == "split_east_west" or _requires_opposite_side_split(relations, "west", "east"):
-        split_barrier = np.maximum(
-            split_barrier,
-            _axis_aligned_ocean_barrier(terrain, "vertical", center=0.5, width=0.075),
-        )
-        split_barrier = np.maximum(
-            split_barrier,
-            terrain._elliptic_gaussian(0.5, 0.5, 0.5, 0.095, 0.0),
-        )
+        split_barrier = np.maximum(split_barrier, _natural_split_barrier(terrain, axis="vertical"))
     elif layout_template == "split_north_south" or _requires_opposite_side_split(relations, "north", "south"):
-        split_barrier = np.maximum(
-            split_barrier,
-            _axis_aligned_ocean_barrier(terrain, "horizontal", center=0.5, width=0.075),
-        )
-        split_barrier = np.maximum(
-            split_barrier,
-            terrain._elliptic_gaussian(0.5, 0.5, 0.095, 0.5, 0.0),
-        )
+        split_barrier = np.maximum(split_barrier, _natural_split_barrier(terrain, axis="horizontal"))
 
     if "center" in sea_zones and {"west", "east"} <= positions:
         split_barrier = np.maximum(
             split_barrier,
-            _axis_aligned_ocean_barrier(terrain, "vertical", center=0.5, width=0.08),
+            _natural_split_barrier(terrain, axis="vertical"),
         )
     if "center" in sea_zones and {"north", "south"} <= positions and sea_style != "inland":
         split_barrier = np.maximum(
             split_barrier,
-            _axis_aligned_ocean_barrier(terrain, "horizontal", center=0.5, width=0.08),
+            _natural_split_barrier(terrain, axis="horizontal"),
         )
 
     inland_basin = np.zeros_like(shaped)
     if sea_style == "inland" or layout_template == "mediterranean":
-        inland_basin = np.maximum(
-            inland_basin,
-            terrain._elliptic_gaussian(0.5, 0.5, 0.2, 0.32, 0.0),
-        )
-        inland_basin = np.maximum(
-            inland_basin,
-            terrain._elliptic_gaussian(0.5, 0.5, 0.13, 0.4, 0.0) * 0.9,
-        )
+        inland_basin = np.maximum(inland_basin, _natural_inland_sea_basin(terrain))
         if {"north", "south"} <= positions:
             inland_basin = np.maximum(
                 inland_basin,
-                terrain._elliptic_gaussian(0.5, 0.5, 0.16, 0.36, 0.0),
+                terrain._elliptic_gaussian(0.5, 0.5, 0.11, 0.26, 0.04) * 0.72,
             )
 
-    shaped = _force_water_mask(shaped, split_barrier, base_depth=-0.34, mask_threshold=0.52)
-    shaped = _force_water_mask(shaped, inland_basin, base_depth=-0.3, mask_threshold=0.44)
+    shaped = _force_water_mask(shaped, split_barrier, base_depth=-0.32, mask_threshold=0.62)
+    shaped = _force_water_mask(shaped, inland_basin, base_depth=-0.28, mask_threshold=0.5)
     return shaped
 
 
@@ -667,6 +646,113 @@ def _force_water_mask(
     forced = mask >= mask_threshold
     shaped[forced] = np.minimum(shaped[forced], target[forced])
     return shaped
+
+
+def _natural_split_barrier(terrain: TerrainGenerator, axis: str) -> np.ndarray:
+    channel = _meandering_channel_mask(terrain, axis=axis, center=0.495, width=0.05, waviness=0.04, skew=0.05)
+    connector = _natural_strait_connector(terrain, axis=axis)
+    mask = np.maximum(channel, connector * 0.9)
+    if axis == "vertical":
+        asym_lobes = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.32, 0.47, 0.09, 0.045, -0.2) * 0.68,
+                terrain._elliptic_gaussian(0.64, 0.53, 0.12, 0.05, 0.24) * 0.82,
+                terrain._elliptic_gaussian(0.84, 0.49, 0.07, 0.038, -0.1) * 0.52,
+            ]
+        )
+    else:
+        asym_lobes = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.47, 0.3, 0.045, 0.09, 0.18) * 0.68,
+                terrain._elliptic_gaussian(0.54, 0.66, 0.05, 0.12, -0.22) * 0.82,
+                terrain._elliptic_gaussian(0.49, 0.85, 0.038, 0.07, 0.08) * 0.5,
+            ]
+        )
+    mask = np.maximum(mask, asym_lobes)
+    return _naturalize_water_mask(terrain, mask, amplitude=0.23, smooth_passes=2, asymmetry=0.14, axis=axis)
+
+
+def _natural_inland_sea_basin(terrain: TerrainGenerator) -> np.ndarray:
+    basin = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.46, 0.42, 0.11, 0.14, -0.24),
+            terrain._elliptic_gaussian(0.54, 0.6, 0.1, 0.18, 0.22),
+            terrain._elliptic_gaussian(0.49, 0.53, 0.075, 0.22, 0.11) * 0.9,
+            terrain._elliptic_gaussian(0.52, 0.47, 0.055, 0.26, -0.08) * 0.62,
+        ]
+    )
+    coves = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.39, 0.33, 0.055, 0.12, -0.72) * 0.8,
+            terrain._elliptic_gaussian(0.61, 0.68, 0.045, 0.09, 0.44) * 0.58,
+            terrain._elliptic_gaussian(0.47, 0.74, 0.04, 0.085, 0.3) * 0.54,
+            terrain._elliptic_gaussian(0.56, 0.24, 0.05, 0.075, -0.4) * 0.46,
+        ]
+    )
+    mask = np.maximum(basin, coves)
+    return _naturalize_water_mask(terrain, mask, amplitude=0.2, smooth_passes=3, asymmetry=0.18, axis="vertical")
+
+
+def _natural_strait_connector(terrain: TerrainGenerator, axis: str) -> np.ndarray:
+    if axis == "vertical":
+        return _meandering_channel_mask(terrain, axis="vertical", center=0.49, width=0.042, waviness=0.024, skew=0.028)
+    return _meandering_channel_mask(terrain, axis="horizontal", center=0.51, width=0.044, waviness=0.02, skew=-0.024)
+
+
+def _meandering_channel_mask(
+    terrain: TerrainGenerator,
+    axis: str,
+    center: float,
+    width: float,
+    waviness: float,
+    skew: float = 0.0,
+) -> np.ndarray:
+    path_noise = terrain._fbm(scale=92.0, octaves=3, persistence=0.56, lacunarity=2.0, offset=417.0)
+    width_noise = terrain._fbm(scale=74.0, octaves=3, persistence=0.52, lacunarity=2.15, offset=523.0)
+    if axis == "vertical":
+        centerline = center + (np.mean(path_noise, axis=1, keepdims=True) * 2.0 - 1.0) * waviness
+        row_wave = np.sin((terrain._y_norm[:, :1] * np.pi * 2.3) + 0.45) * (waviness * 0.34)
+        centerline = centerline + row_wave + (terrain._y_norm[:, :1] - 0.5) * skew
+        width_map = width * (0.82 + np.mean(width_noise, axis=1, keepdims=True) * 0.52)
+        distance = np.abs(terrain._x_norm - centerline)
+    else:
+        centerline = center + (np.mean(path_noise, axis=0, keepdims=True) * 2.0 - 1.0) * waviness
+        col_wave = np.sin((terrain._x_norm[:1, :] * np.pi * 2.1) + 0.3) * (waviness * 0.34)
+        centerline = centerline + col_wave + (terrain._x_norm[:1, :] - 0.5) * skew
+        width_map = width * (0.82 + np.mean(width_noise, axis=0, keepdims=True) * 0.52)
+        distance = np.abs(terrain._y_norm - centerline)
+    channel = np.exp(-(distance**2) / np.maximum(width_map**2, 1e-4))
+    return gaussian_smooth(channel.astype(np.float32))
+
+
+def _naturalize_water_mask(
+    terrain: TerrainGenerator,
+    mask: np.ndarray,
+    amplitude: float,
+    smooth_passes: int,
+    asymmetry: float = 0.0,
+    axis: str = "vertical",
+) -> np.ndarray:
+    coast_noise = terrain._fbm(scale=46.0, octaves=4, persistence=0.55, lacunarity=2.15, offset=611.0) * 2.0 - 1.0
+    macro_noise = terrain._fbm(scale=96.0, octaves=3, persistence=0.58, lacunarity=2.0, offset=677.0) * 2.0 - 1.0
+    edge_band = np.clip(mask * (1.0 - mask) * 4.2, 0.0, 1.0)
+    disturbed = mask + edge_band * (coast_noise * amplitude + macro_noise * (amplitude * 0.55))
+    directional = _asymmetry_field(terrain, axis=axis)
+    disturbed += edge_band * directional * asymmetry
+    embayments = np.clip(mask - 0.52, 0.0, 1.0) * np.clip(-coast_noise, 0.0, 1.0) * (amplitude * 0.22)
+    disturbed = np.clip(disturbed + embayments * (1.0 + directional * 0.45), 0.0, 1.0)
+    for _ in range(max(1, smooth_passes)):
+        disturbed = gaussian_smooth(disturbed)
+    return np.clip(disturbed, 0.0, 1.0).astype(np.float32)
+
+
+def _asymmetry_field(terrain: TerrainGenerator, axis: str) -> np.ndarray:
+    if axis == "vertical":
+        field = (terrain._x_norm - 0.5) * 1.15 + (terrain._y_norm - 0.5) * 0.55
+    else:
+        field = (terrain._y_norm - 0.5) * 1.15 + (terrain._x_norm - 0.5) * 0.55
+    low_freq = terrain._fbm(scale=128.0, octaves=2, persistence=0.62, lacunarity=1.95, offset=733.0) * 2.0 - 1.0
+    return np.clip(field + low_freq * 0.35, -1.0, 1.0).astype(np.float32)
 
 
 def _continent_component(
