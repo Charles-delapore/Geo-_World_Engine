@@ -1,5 +1,7 @@
 # Geo-WorldEngine Beta
 
+Geo-WorldEngine是一个（设想中）AI驱动程序化幻想地图生成系统,融合LLM语义理解、计算几何、物理模拟和分布式任务调度,支持自然语言约束的交互式世界构建。
+
 Geo-WorldEngine Beta 是当前的世界生成实验工作区。它包含：
 
 - FastAPI 后端，统一使用 `/api/maps/{taskId}` 任务资源模型
@@ -11,9 +13,8 @@ Geo-WorldEngine Beta 是当前的世界生成实验工作区。它包含：
 ## 安全
 
 仓库已按公开版本控制做了保守处理：
-
 - `.env`、本地密钥、数据库、产物目录、日志、缓存、虚拟环境默认忽略
-- 发布前仍应手动确认没有把真实 API key、用户 prompt 导出、调试转储写进未忽略路径
+
 
 ## 目录
 
@@ -46,8 +47,7 @@ Set-Location .\GEO
 
 beta 现在集成了 P0 版本的只读 RAG：
 
-- 只增强 `自然语言 -> WorldPlan`
-- 不替代地形生成器
+- 只增强 `自然语言 -> WorldPlan`,不替代地形生成器
 - 启动时自动初始化内置 recipe 库
 - planner 会记录 `rag_meta`
 - 前端任务状态面板会显示：
