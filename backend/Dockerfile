@@ -4,7 +4,7 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV NUMBA_DISABLE_JIT=1
+ENV NUMBA_CACHE_DIR=/tmp/numba_cache
 
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
@@ -19,6 +19,8 @@ COPY bootstrap_db.py .
 COPY celery_worker.py .
 COPY tile_worker.py .
 COPY docker-entrypoint.sh .
+COPY tests ./tests
+COPY pyproject.toml .
 
 RUN mkdir -p /app/data && \
     chmod +x /app/docker-entrypoint.sh && \

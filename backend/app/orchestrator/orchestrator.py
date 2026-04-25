@@ -61,7 +61,15 @@ def execute_generation(task_id: str) -> None:
         plan_json = task.plan_json or {}
 
     arrays, preview = render_world(plan_json, width=width, height=height, seed=seed)
+    metric_report_raw = arrays.pop("metric_report", None)
     repo.save_world(task_id, **arrays)
+
+    if metric_report_raw is not None:
+        metric_str = metric_report_raw.decode("utf-8") if isinstance(metric_report_raw, bytes) else str(metric_report_raw)
+        with session_scope() as db:
+            task = db.get(TaskRecord, task_id)
+            if task is not None:
+                task.metric_report = metric_str
 
     transition_task(task_id, TaskStatus.RENDERING_IMAGE, progress=80, reason="preview")
     repo.save_preview(task_id, preview)

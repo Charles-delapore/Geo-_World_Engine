@@ -11,6 +11,9 @@ export interface MapDiagnostics {
   seed?: number
   width: number
   height: number
+  generationBackend: string
+  topologyIntent: string | null
+  topologyModifiers: Record<string, string>
   layoutTemplate: string
   seaStyle: string
   landRatio: number
@@ -23,10 +26,13 @@ export interface MapDiagnostics {
   continentCount: number
   mountainCount: number
   seaZoneCount: number
+  waterBodyCount: number
+  regionalRelationCount: number
   ragEnabled: boolean
   ragExamples: number
   ragTopSimilarity: number | null
   ragFallbackReason: string | null
+  metricReport: Record<string, unknown> | null
 }
 
 export interface MapTask {

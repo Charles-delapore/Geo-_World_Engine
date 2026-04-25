@@ -16,6 +16,13 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["open-ocean"],
             "profile": {"layout_template": "split_east_west", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["west", "east"]],
+        },
         "tags": ["split", "open-sea", "dual-continent"],
     },
     {
@@ -31,6 +38,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["inland-sea"],
             "profile": {"layout_template": "mediterranean", "sea_style": "inland"},
+        },
+        "topology_intent": {
+            "kind": "central_enclosed_inland_sea",
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["split", "inland-sea", "mediterranean"],
     },
@@ -48,6 +60,12 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["single-island"],
             "profile": {"layout_template": "single_island", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["island", "single-continent", "四面环海", "环海大陆"],
     },
     {
@@ -63,6 +81,13 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["north-south-split"],
             "profile": {"layout_template": "split_north_south", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["north", "south"]],
         },
         "tags": ["north-south", "open-sea"],
     },
@@ -80,6 +105,13 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["orographic-east"],
             "profile": {"layout_template": "split_east_west", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["west", "east"]],
+        },
         "tags": ["mountains", "east"],
     },
     {
@@ -95,6 +127,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["inland-basin", "north-rim"],
             "profile": {"layout_template": "mediterranean", "sea_style": "inland"},
+        },
+        "topology_intent": {
+            "kind": "central_enclosed_inland_sea",
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["inland-sea", "north-mountains"],
     },
@@ -112,6 +149,12 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["tropical", "archipelago"],
             "profile": {"layout_template": "archipelago", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "archipelago_chain",
+            "min_land_component_count": 3,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": False,
+        },
         "tags": ["archipelago", "tropical"],
     },
     {
@@ -127,6 +170,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [{"region": "east", "length": "short"}],
             "climate_hints": ["arid", "supercontinent"],
             "profile": {"layout_template": "supercontinent", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["supercontinent", "arid"],
     },
@@ -144,6 +192,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["strait"],
             "profile": {"layout_template": "mediterranean", "sea_style": "strait"},
         },
+        "topology_intent": {
+            "kind": "peninsula_coast",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["peninsula", "strait"],
     },
     {
@@ -159,6 +212,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["frozen"],
             "profile": {"layout_template": "default", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["north", "cold"],
     },
@@ -177,6 +235,13 @@ DEFAULT_RECIPES: list[dict] = [
             "profile": {"layout_template": "split_east_west", "sea_style": "open"},
         },
         "tags": ["split", "open-sea", "north-mountains", "北部有山脉", "北缘山脉"],
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["west", "east"]],
+        },
     },
     {
         "id": "east-west-open-sea-west-mountains",
@@ -191,6 +256,13 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [{"region": "west", "length": "long"}],
             "climate_hints": ["open-ocean", "west-orogen"],
             "profile": {"layout_template": "split_east_west", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["west", "east"]],
         },
         "tags": ["split", "open-sea", "west-mountains"],
     },
@@ -208,6 +280,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["inland-sea", "east-orogen"],
             "profile": {"layout_template": "mediterranean", "sea_style": "inland"},
         },
+        "topology_intent": {
+            "kind": "central_enclosed_inland_sea",
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["inland-sea", "east-mountains"],
     },
     {
@@ -223,6 +300,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["inland-sea", "south-rim"],
             "profile": {"layout_template": "mediterranean", "sea_style": "inland"},
+        },
+        "topology_intent": {
+            "kind": "central_enclosed_inland_sea",
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["inland-sea", "south-mountains"],
     },
@@ -240,6 +322,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["single-island", "west-peninsula"],
             "profile": {"layout_template": "single_island", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["single-island", "peninsula", "west"],
     },
     {
@@ -255,6 +342,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [{"region": "center", "length": "long"}],
             "climate_hints": ["single-island", "east-orogen"],
             "profile": {"layout_template": "single_island", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["single-island", "east-mountains"],
     },
@@ -272,6 +364,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["archipelago", "northeast-chain"],
             "profile": {"layout_template": "archipelago", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "archipelago_chain",
+            "min_land_component_count": 3,
+            "forbid_cross_cut": False,
+        },
         "tags": ["archipelago", "northeast"],
     },
     {
@@ -287,6 +384,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["archipelago", "tropical", "south-seas"],
             "profile": {"layout_template": "archipelago", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "archipelago_chain",
+            "min_land_component_count": 3,
+            "forbid_cross_cut": False,
         },
         "tags": ["archipelago", "south", "tropical"],
     },
@@ -304,6 +406,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["supercontinent", "central-mountains"],
             "profile": {"layout_template": "supercontinent", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["supercontinent", "central-mountains"],
     },
     {
@@ -319,6 +426,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["frozen", "inland-sea"],
             "profile": {"layout_template": "mediterranean", "sea_style": "inland"},
+        },
+        "topology_intent": {
+            "kind": "central_enclosed_inland_sea",
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["frozen", "inland-sea", "north"],
     },
@@ -336,6 +448,13 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["open-ocean", "arid"],
             "profile": {"layout_template": "split_east_west", "sea_style": "open", "palette_hint": "arid"},
         },
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["west", "east"]],
+        },
         "tags": ["open-sea", "arid", "split"],
     },
     {
@@ -351,6 +470,13 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [{"region": "east", "length": "long"}],
             "climate_hints": ["open-ocean", "east-orogen"],
             "profile": {"layout_template": "split_east_west", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "two_continents_with_rift_sea",
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+            "must_disconnect_pairs": [["west", "east"]],
         },
         "tags": ["open-sea", "east-mountains", "split", "东部大陆有山脉"],
     },
@@ -368,6 +494,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["inland-sea", "north-rim"],
             "profile": {"layout_template": "mediterranean", "sea_style": "inland"},
         },
+        "topology_intent": {
+            "kind": "central_enclosed_inland_sea",
+            "target_water_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["inland-sea", "north-mountains", "split", "北部有山脉", "中间有内海"],
     },
     {
@@ -383,6 +514,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["single-island", "east-peninsula"],
             "profile": {"layout_template": "single_island", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
         },
         "tags": ["single-island", "peninsula", "east", "东侧伸出半岛", "四面环海"],
     },
@@ -400,6 +536,11 @@ DEFAULT_RECIPES: list[dict] = [
             "climate_hints": ["single-island", "west-orogen"],
             "profile": {"layout_template": "single_island", "sea_style": "open"},
         },
+        "topology_intent": {
+            "kind": "single_island",
+            "target_land_component_count": 1,
+            "forbid_cross_cut": True,
+        },
         "tags": ["single-island", "west-mountains", "西侧有山脉", "四面环海"],
     },
     {
@@ -415,6 +556,11 @@ DEFAULT_RECIPES: list[dict] = [
             "river_hints": [],
             "climate_hints": ["archipelago", "tropical", "northeast-chain"],
             "profile": {"layout_template": "archipelago", "sea_style": "open"},
+        },
+        "topology_intent": {
+            "kind": "archipelago_chain",
+            "min_land_component_count": 3,
+            "forbid_cross_cut": False,
         },
         "tags": ["archipelago", "tropical", "northeast"],
     },

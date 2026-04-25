@@ -19,13 +19,10 @@ def get_preview(task_id: str):
 
 
 @router.get("/{task_id}/tiles/manifest.json")
-def get_manifest(task_id: str, request: Request):
+def get_manifest(task_id: str):
     if not repo.has_manifest(task_id):
         raise HTTPException(status_code=404, detail="Manifest not found")
     manifest = json.loads(repo.read_manifest_bytes(task_id).decode("utf-8"))
-    tile_template = manifest.get("tile_url_template")
-    if isinstance(tile_template, str) and tile_template.startswith("/"):
-        manifest["tile_url_template"] = str(request.url_for("root")).rstrip("/") + tile_template
     return Response(content=json.dumps(manifest, ensure_ascii=False), media_type="application/json")
 
 

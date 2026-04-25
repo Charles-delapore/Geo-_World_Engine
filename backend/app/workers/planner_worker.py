@@ -13,6 +13,7 @@ from app.core.world_plan import (
     RegionalRelation,
     RiverHint,
     WaterBody,
+    TopologyIntent,
     GenerationModuleSpec,
     WorldPlan,
 )
@@ -87,6 +88,7 @@ def build_world_plan(prompt: str, params: dict) -> WorldPlan:
         river_hints=[RiverHint(**item) for item in parsed.get("river_hints") or []],
         water_bodies=[WaterBody(**item) for item in parsed.get("water_bodies") or []],
         regional_relations=[RegionalRelation(**item) for item in parsed.get("regional_relations") or []],
+        topology_intent=TopologyIntent(**parsed["topology_intent"]) if parsed.get("topology_intent") else None,
         module_sequence=[GenerationModuleSpec(**item) for item in parsed.get("module_sequence") or []],
         climate_hints=list(parsed.get("climate_hints") or []),
         rag_meta=rag_meta,
@@ -96,7 +98,9 @@ def build_world_plan(prompt: str, params: dict) -> WorldPlan:
     summary = (
         f"{summary}\n"
         f"Backend: {plan.generation_backend}, water_bodies={len(plan.water_bodies)}, "
-        f"regional_relations={len(plan.regional_relations)}, modules={len(plan.module_sequence)}\n"
+        f"regional_relations={len(plan.regional_relations)}, modules={len(plan.module_sequence)}, "
+        f"topology={plan.topology_intent.kind if plan.topology_intent else 'none'}, "
+        f"modifiers={plan.topology_intent.modifiers if plan.topology_intent else {}}\n"
         f"Profile: layout={plan.profile.layout_template}, land={plan.profile.land_ratio:.2f}, "
         f"sea={plan.profile.sea_style}, ruggedness={plan.profile.ruggedness:.2f}, coast={plan.profile.coast_complexity:.2f}, "
         f"moisture={plan.profile.moisture:.2f}, palette={plan.profile.palette_hint}\n"

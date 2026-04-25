@@ -167,3 +167,49 @@ class ArtifactRepository:
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         return buffer.getvalue()
+
+    def debug_dir(self, task_id: str) -> Path:
+        path = self.task_dir(task_id) / "debug"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_debug_image(self, task_id: str, name: str, image: Image.Image) -> Path:
+        path = self.debug_dir(task_id) / f"{name}.png"
+        if self._uses_s3():
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            s3_client.put_bytes(
+                self._object_key("maps", task_id, "debug", f"{name}.png"),
+                buffer.getvalue(),
+                "image/png",
+            )
+            return path
+        image.save(path, format="PNG")
+        return path
+
+    def save_debug_json(self, task_id: str, name: str, data: dict) -> Path:
+        path = self.debug_dir(task_id) / f"{name}.json"
+        encoded = json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        if self._uses_s3():
+            s3_client.put_bytes(
+                self._object_key("maps", task_id, "debug", f"{name}.json"),
+                encoded,
+                "application/json",
+            )
+            return path
+        path.write_bytes(encoded)
+        return path
+
+    def save_debug_array(self, task_id: str, name: str, array: np.ndarray) -> Path:
+        path = self.debug_dir(task_id) / f"{name}.npz"
+        if self._uses_s3():
+            buffer = io.BytesIO()
+            np.savez_compressed(buffer, **{name: array})
+            s3_client.put_bytes(
+                self._object_key("maps", task_id, "debug", f"{name}.npz"),
+                buffer.getvalue(),
+                "application/octet-stream",
+            )
+            return path
+        np.savez_compressed(path, **{name: array})
+        return path

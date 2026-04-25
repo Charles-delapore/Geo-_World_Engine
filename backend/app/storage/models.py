@@ -41,6 +41,7 @@ class TaskRecord(Base):
     preview_ready: Mapped[bool] = mapped_column(Boolean, default=False)
     tiles_ready: Mapped[bool] = mapped_column(Boolean, default=False)
     error_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metric_report: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -234,21 +234,24 @@ def get_constraints_summary(constraints: MapConstraints) -> str:
 def infer_world_profile(prompt: str, constraints: MapConstraints) -> WorldProfile:
     lower = _normalize_prompt(prompt)
     profile = WorldProfile()
+    landform_class = _classify_landform_semantics(lower, constraints)
+    has_single_island = landform_class == "single_island"
+    has_archipelago = landform_class == "archipelago"
     has_inland_sea = _contains_any(lower, ["inland sea", "inner sea", "enclosed sea", "内海", "内陆海"])
     has_open_separator = _contains_any(lower, ["隔着海", "被海隔开", "ocean between", "sea between", "separated by sea"])
     has_strait_or_bay = _contains_any(lower, ["海峡", "strait", "gulf", "bay", "海湾"])
 
-    if _contains_any(lower, ["surrounded by sea", "island continent", "四面环海", "环海大陆", "海中大陆"]):
+    if has_single_island and not has_archipelago:
         profile.layout_template = "single_island"
         profile.land_ratio = 0.38
         profile.coast_complexity = 0.88
         profile.island_factor = 0.18
         profile.sea_style = "open"
-    elif _contains_any(lower, ["supercontinent", "single continent", "盘古大陆", "超大陆", "单一大陆"]):
+    elif landform_class == "supercontinent":
         profile.layout_template = "supercontinent"
         profile.land_ratio = 0.62
         profile.island_factor = 0.08
-    elif len(constraints.continents) >= 3 or _contains_any(lower, ["archipelago", "islands", "群岛", "列岛"]):
+    elif len(constraints.continents) >= 3 or has_archipelago:
         profile.layout_template = "archipelago"
         profile.land_ratio = 0.32
         profile.island_factor = 0.75
@@ -352,6 +355,7 @@ def parse_with_rag(
         "river_hints": [{"region": region, "length": "long"} for region in constraints.river_sources],
         "water_bodies": _extract_water_bodies(constraints, profile),
         "regional_relations": _extract_regional_relations(user_prompt, constraints),
+        "topology_intent": _build_topology_intent(user_prompt, constraints, profile),
         "module_sequence": _build_module_sequence(user_prompt, constraints, profile, generation_backend),
         "climate_hints": _build_climate_hints(profile),
     }
@@ -359,6 +363,16 @@ def parse_with_rag(
         plan = _merge_rag_examples(user_prompt, plan, examples)
     plan["constraints"] = _sync_constraints_from_plan(plan, constraints).model_dump(mode="json")
     plan["profile"] = _sync_profile_from_plan(user_prompt, plan, profile).model_dump(mode="json")
+
+    from app.core.topology_validator import validate_world_plan, auto_fix_world_plan
+    issues = validate_world_plan(plan)
+    if issues:
+        logger.warning("WorldPlan validation issues: %s", issues)
+        plan = auto_fix_world_plan(plan)
+        recheck = validate_world_plan(plan)
+        if recheck:
+            logger.warning("WorldPlan still has issues after auto-fix: %s", recheck)
+
     return plan
 
 
@@ -403,6 +417,8 @@ def _enrich_constraints_from_sea_language(user_prompt: str, constraints: MapCons
             "东部和西部",
         ],
     )
+    landform_class = _classify_landform_semantics(lower, enriched)
+    has_single_island = landform_class == "single_island"
 
     if has_middle_separator or (has_east_west_split and _contains_any(lower, SEA_TERMS)):
         if len(continents) < 2 or positions == {"center"}:
@@ -422,8 +438,192 @@ def _enrich_constraints_from_sea_language(user_prompt: str, constraints: MapCons
         if "center" not in enriched.sea_zones:
             enriched.sea_zones.append("center")
 
+    if has_single_island:
+        enriched.continents = [ContinentConstraint(position="center", size=0.38)]
+        enriched.sea_zones = []
+
+    if has_middle_separator and {"west", "east"} <= {item.position for item in enriched.continents}:
+        enriched.continents = [item for item in enriched.continents if item.position in {"west", "east"}]
+
     enriched.sea_zones = _dedupe(enriched.sea_zones)
     return normalize_constraints(enriched)
+
+
+def _build_topology_intent(user_prompt: str, constraints: MapConstraints, profile: WorldProfile) -> dict | None:
+    normalized = _normalize_prompt(user_prompt)
+    positions = {item.position for item in constraints.continents}
+    landform_class = _classify_landform_semantics(normalized, constraints)
+    modifiers = _extract_topology_modifiers(normalized, landform_class, profile)
+    has_single_island = landform_class == "single_island"
+    if has_single_island:
+        shape_axis = modifiers.get("shape_axis", "east_west")
+        elongation_target = 1.8 if modifiers.get("shape_bias") == "elongated" else None
+        return {
+            "kind": "single_island",
+            "landform_mode": "single_mass",
+            "sea_mode": "open_ocean",
+            "exact_landmass_count": 1,
+            "forbid_cross_cut": True,
+            "notes": ["avoid archipelago breakup", "keep one dominant island"],
+            "modifiers": modifiers,
+            "target_land_component_count": 1,
+            "target_water_component_count": 1,
+            "main_axis": shape_axis if modifiers.get("shape_bias") == "elongated" else "none",
+            "elongation_target": elongation_target,
+            "symmetry_break": 0.3,
+            "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.5)),
+        }
+
+    if landform_class == "archipelago":
+        density = modifiers.get("island_density", "balanced")
+        min_count = 4 if density == "dense" else 3
+        return {
+            "kind": "archipelago_chain",
+            "landform_mode": "fragmented_islands",
+            "sea_mode": "open_ocean",
+            "forbid_cross_cut": False,
+            "notes": ["prefer multiple separated islands", "avoid single fused mainland"],
+            "modifiers": modifiers,
+            "min_land_component_count": min_count,
+            "target_water_component_count": 1,
+            "symmetry_break": 0.4,
+            "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.5)),
+        }
+
+    if landform_class == "peninsula":
+        peninsula_anchor = constraints.continents[0].position if constraints.continents else "east"
+        return {
+            "kind": "peninsula_coast",
+            "landform_mode": "coastal_spur",
+            "sea_mode": "open_ocean",
+            "forbid_cross_cut": True,
+            "notes": [f"extend a peninsula from {peninsula_anchor}", "avoid fragmented island chain"],
+            "modifiers": modifiers,
+            "target_land_component_count": 1,
+            "symmetry_break": 0.35,
+            "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.5)),
+        }
+
+    if profile.sea_style == "inland" and ("center" in constraints.sea_zones or not constraints.sea_zones):
+        return {
+            "kind": "central_enclosed_inland_sea",
+            "landform_mode": "two_rims",
+            "sea_mode": "enclosed_basin",
+            "exact_landmass_count": 2 if {"north", "south"} <= positions else None,
+            "forbid_cross_cut": True,
+            "notes": ["keep enclosed sea in center", "avoid open-ocean full cross cut"],
+            "modifiers": modifiers,
+            "target_water_component_count": 1,
+            "symmetry_break": 0.3,
+            "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.5)),
+        }
+
+    if {"west", "east"} <= positions and (
+        profile.layout_template == "split_east_west"
+        or _contains_any(normalized, ["隔开", "分隔", "separated by sea", "ocean between", "sea between"])
+    ):
+        rift_width = modifiers.get("rift_width", "balanced")
+        return {
+            "kind": "two_continents_with_rift_sea",
+            "landform_mode": "twin_continents",
+            "sea_mode": "rift_sea",
+            "exact_landmass_count": 2,
+            "must_disconnect_pairs": [["west", "east"]],
+            "forbid_cross_cut": True,
+            "notes": ["keep only two dominant continents", "central sea should disconnect west and east"],
+            "modifiers": modifiers,
+            "target_land_component_count": 2,
+            "target_water_component_count": 1,
+            "symmetry_break": 0.3,
+            "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.5)),
+        }
+
+    return None
+
+
+def _extract_topology_modifiers(normalized_prompt: str, landform_class: str, profile: WorldProfile) -> dict[str, str]:
+    modifiers: dict[str, str] = {}
+
+    if landform_class == "single_island":
+        if _contains_any(normalized_prompt, ["elongated", "long", "slender", "narrow", "狭长", "细长", "长条"]):
+            modifiers["shape_bias"] = "elongated"
+        elif _contains_any(normalized_prompt, ["round", "rounded", "circular", "圆形", "圆润", "浑圆"]):
+            modifiers["shape_bias"] = "round"
+        else:
+            modifiers["shape_bias"] = "balanced"
+        if _contains_any(normalized_prompt, ["east west", "east-west", "横向", "东西向", "东西走向"]):
+            modifiers["shape_axis"] = "east_west"
+        elif _contains_any(normalized_prompt, ["north south", "north-south", "纵向", "南北向", "南北走向"]):
+            modifiers["shape_axis"] = "north_south"
+        else:
+            modifiers["shape_axis"] = "east_west"
+
+    if landform_class == "archipelago":
+        if _contains_any(normalized_prompt, ["dense", "packed", "clustered", "密集", "稠密", "成片"]):
+            modifiers["island_density"] = "dense"
+        elif _contains_any(normalized_prompt, ["sparse", "scattered", "widely spaced", "稀疏", "零散", "分散"]):
+            modifiers["island_density"] = "sparse"
+        else:
+            modifiers["island_density"] = "balanced"
+
+    if profile.layout_template == "split_east_west" or _contains_any(
+        normalized_prompt,
+        ["隔开", "分隔", "separated by sea", "ocean between", "sea between"],
+    ):
+        if _contains_any(normalized_prompt, ["narrow", "thin", "slim", "狭窄", "窄", "细长海峡"]):
+            modifiers["rift_width"] = "narrow"
+        elif _contains_any(normalized_prompt, ["broad", "wide", "vast", "宽阔", "宽广", "开阔"]):
+            modifiers["rift_width"] = "broad"
+        else:
+            modifiers["rift_width"] = "balanced"
+        if _contains_any(normalized_prompt, ["broken", "fragmented", "segmented", "断续", "破碎", "支离", "岛链海峡"]):
+            modifiers["rift_profile"] = "broken"
+        elif _contains_any(normalized_prompt, ["smooth", "clean", "平顺", "整洁"]):
+            modifiers["rift_profile"] = "smooth"
+        else:
+            modifiers["rift_profile"] = "natural"
+
+    if profile.sea_style == "inland" or _contains_any(normalized_prompt, ["内海", "inland sea", "inner sea", "enclosed sea"]):
+        if _contains_any(normalized_prompt, ["compact", "tight", "small", "紧凑", "收敛", "较小"]):
+            modifiers["basin_shape"] = "compact"
+        elif _contains_any(normalized_prompt, ["broad", "wide", "vast", "宽阔", "广阔", "辽阔"]):
+            modifiers["basin_shape"] = "broad"
+        elif _contains_any(normalized_prompt, ["branched", "bayed", "fjord", "多海湾", "支汊", "曲折", "峡湾"]):
+            modifiers["basin_shape"] = "branched"
+        else:
+            modifiers["basin_shape"] = "balanced"
+        if _contains_any(normalized_prompt, ["rift", "裂谷", "断陷", "断裂海"]):
+            modifiers["basin_style"] = "rift"
+        elif _contains_any(normalized_prompt, ["mediterranean", "地中海式", "半封闭", "半围合"]):
+            modifiers["basin_style"] = "mediterranean"
+        else:
+            modifiers["basin_style"] = "balanced"
+
+    return modifiers
+
+
+def _classify_landform_semantics(normalized_prompt: str, constraints: MapConstraints) -> str:
+    has_archipelago = _contains_any(normalized_prompt, ["archipelago", "islands", "群岛", "列岛", "岛链"])
+    has_peninsula = _contains_any(normalized_prompt, ["peninsula", "半岛"])
+    has_single_island = _contains_any(
+        normalized_prompt,
+        ["surrounded by sea", "island continent", "四面环海", "环海岛", "海中岛", "一座岛", "单个岛", "孤岛"],
+    )
+    has_supercontinent = _contains_any(normalized_prompt, ["supercontinent", "single continent", "盘古大陆", "超大陆", "单一大陆"])
+
+    if has_archipelago:
+        return "archipelago"
+    if has_single_island:
+        return "single_island"
+    if has_peninsula:
+        return "peninsula"
+    if has_supercontinent:
+        return "supercontinent"
+    if len(constraints.continents) >= 3:
+        return "archipelago"
+    if len(constraints.continents) == 1 and constraints.continents[0].position == "center":
+        return "single_landmass"
+    return "generic"
 
 
 def _extract_positions(prompt: str) -> List[str]:
@@ -451,7 +651,7 @@ def _infer_mountain_orientation(location: str) -> str | None:
 
 def _extract_island_chains(prompt: str) -> list[dict]:
     normalized = _normalize_prompt(prompt)
-    if _contains_any(normalized, ["archipelago", "island chain", "群岛", "列岛", "岛链"]):
+    if _classify_landform_semantics(normalized, MapConstraints()) == "archipelago":
         positions = _extract_positions(prompt)
         return [{"position": position, "density": 0.66} for position in (positions[:2] or ["center"])]
     return []
@@ -459,7 +659,7 @@ def _extract_island_chains(prompt: str) -> list[dict]:
 
 def _extract_peninsulas(prompt: str) -> list[dict]:
     normalized = _normalize_prompt(prompt)
-    if not _contains_any(normalized, ["peninsula", "半岛"]):
+    if _classify_landform_semantics(normalized, MapConstraints()) != "peninsula":
         return []
     positions = _extract_positions(prompt)
     return [{"location": position, "size": 0.18} for position in (positions[:1] or ["west"])]
@@ -470,7 +670,12 @@ def _extract_inland_seas(prompt: str, constraints: MapConstraints, profile: Worl
     if profile.sea_style != "inland" and not _contains_any(normalized, ["内海", "inner sea", "inland sea", "内陆海"]):
         return []
     position = (constraints.sea_zones[:1] or ["center"])[0]
-    connection = "strait" if _contains_any(normalized, ["海峡", "strait"]) else "east ocean"
+    if _contains_any(normalized, ["海峡", "strait"]):
+        connection = "strait"
+    elif _contains_any(normalized, ["open sea", "outer sea", "连接外海", "通向外海"]):
+        connection = "east ocean"
+    else:
+        connection = "enclosed"
     return [{"position": position, "connection": connection}]
 
 

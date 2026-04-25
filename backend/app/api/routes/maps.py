@@ -48,13 +48,13 @@ class MapResource(BaseModel):
 
 
 def _artifact_url(request: Request, path: str) -> str:
-    return str(request.url_for("root")).rstrip("/") + path
+    return f"{settings.API_V1_STR}{path}"
 
 
 def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
-    preview_url = _artifact_url(request, f"{settings.API_V1_STR}/maps/{task.task_id}/preview.png") if task.preview_ready else None
+    preview_url = _artifact_url(request, f"/maps/{task.task_id}/preview.png") if task.preview_ready else None
     manifest_url = (
-        _artifact_url(request, f"{settings.API_V1_STR}/maps/{task.task_id}/tiles/manifest.json") if task.tiles_ready else None
+        _artifact_url(request, f"/maps/{task.task_id}/tiles/manifest.json") if task.tiles_ready else None
     )
     plan = task.plan_json or {}
     profile = plan.get("profile") or {}
@@ -66,6 +66,8 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
         "width": int(params.get("width", settings.DEFAULT_WIDTH)),
         "height": int(params.get("height", settings.DEFAULT_HEIGHT)),
         "generationBackend": plan.get("generation_backend", "gaussian_voronoi"),
+        "topologyIntent": (plan.get("topology_intent") or {}).get("kind"),
+        "topologyModifiers": (plan.get("topology_intent") or {}).get("modifiers") or {},
         "layoutTemplate": profile.get("layout_template", "default"),
         "seaStyle": profile.get("sea_style", "open"),
         "landRatio": float(profile.get("land_ratio", 0.44)),
@@ -85,6 +87,13 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
         "ragTopSimilarity": rag_meta.get("top_similarity"),
         "ragFallbackReason": rag_meta.get("fallback_reason"),
     }
+    metric_report_raw = task.metric_report
+    if metric_report_raw:
+        try:
+            import json as _json
+            diagnostics["metricReport"] = _json.loads(metric_report_raw) if isinstance(metric_report_raw, str) else metric_report_raw
+        except Exception:
+            diagnostics["metricReport"] = None
     return MapResource(
         taskId=task.task_id,
         status=PUBLIC_STATUS[TaskStatus(task.status)],

@@ -53,6 +53,36 @@ class RegionalRelation(BaseModel):
     strength: float = 1.0
 
 
+class WaterZoneSpec(BaseModel):
+    position: str = "center"
+    enclosed: bool = True
+    min_area_ratio: float | None = None
+
+
+class TopologyIntent(BaseModel):
+    kind: str
+    landform_mode: str = "generic"
+    sea_mode: str = "generic"
+    exact_landmass_count: int | None = None
+    must_disconnect_pairs: list[list[str]] = Field(default_factory=list)
+    forbid_cross_cut: bool = False
+    notes: list[str] = Field(default_factory=list)
+    modifiers: dict[str, str] = Field(default_factory=dict)
+    target_land_component_count: int | None = None
+    min_land_component_count: int | None = None
+    max_land_component_count: int | None = None
+    target_water_component_count: int | None = None
+    required_water_zones: list[WaterZoneSpec] = Field(default_factory=list)
+    forbidden_water_zones: list[WaterZoneSpec] = Field(default_factory=list)
+    must_connect_land_pairs: list[list[str]] = Field(default_factory=list)
+    must_connect_water_pairs: list[list[str]] = Field(default_factory=list)
+    main_axis: str = "none"
+    elongation_target: float | None = None
+    symmetry_break: float = 0.3
+    boundary_irregularity: float = 0.5
+    acceptance_metrics: dict = Field(default_factory=dict)
+
+
 class GenerationModuleSpec(BaseModel):
     module: str
     enabled: bool = True
@@ -171,6 +201,7 @@ class WorldPlan(BaseModel):
     river_hints: list[RiverHint] = Field(default_factory=list)
     water_bodies: list[WaterBody] = Field(default_factory=list)
     regional_relations: list[RegionalRelation] = Field(default_factory=list)
+    topology_intent: TopologyIntent | None = None
     module_sequence: list[GenerationModuleSpec] = Field(default_factory=list)
     climate_hints: list[str] = Field(default_factory=list)
     rag_meta: dict = Field(default_factory=dict)

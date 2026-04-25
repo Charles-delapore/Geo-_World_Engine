@@ -30,12 +30,73 @@ def _mirrored_half_difference(mask: np.ndarray) -> float:
     return float(np.mean(left != right))
 
 
+def _count_large_land_components(elevation: np.ndarray, min_cells: int = 160) -> int:
+    from scipy.ndimage import label
+
+    labels, count = label((elevation > 0.0).astype(np.int8))
+    large = 0
+    for component_id in range(1, count + 1):
+        if int(np.sum(labels == component_id)) >= min_cells:
+            large += 1
+    return large
+
+
+def _count_large_water_components(mask: np.ndarray, min_cells: int = 120) -> int:
+    from scipy.ndimage import label
+
+    labels, count = label(mask.astype(np.int8))
+    large = 0
+    for component_id in range(1, count + 1):
+        if int(np.sum(labels == component_id)) >= min_cells:
+            large += 1
+    return large
+
+
 def test_parse_with_rag_emits_beta_module_fields() -> None:
     plan = parse_with_rag("一东一西两个被海隔开的大陆，东北角有高山。")
 
     assert plan["generation_backend"] == "gaussian_voronoi"
     assert plan["water_bodies"]
     assert any(item["relation"] == "separated_by_water" for item in plan["regional_relations"])
+
+
+def test_parse_with_rag_emits_single_island_topology_intent() -> None:
+    plan = parse_with_rag("一座四面环海的岛屿。")
+
+    assert plan["topology_intent"]["kind"] == "single_island"
+    assert plan["topology_intent"]["exact_landmass_count"] == 1
+    assert len(plan["continents"]) == 1
+    assert plan["continents"][0]["position"] == "center"
+    assert plan["island_chains"] == []
+
+
+def test_parse_with_rag_distinguishes_archipelago_and_peninsula() -> None:
+    archipelago = parse_with_rag("中央是一片群岛。")
+    peninsula = parse_with_rag("东侧伸出一条半岛。")
+
+    assert archipelago["profile"]["layout_template"] == "archipelago"
+    assert archipelago["island_chains"]
+    assert archipelago["topology_intent"]["kind"] == "archipelago_chain"
+
+    assert peninsula["peninsulas"]
+    assert peninsula["island_chains"] == []
+    assert peninsula["topology_intent"]["kind"] == "peninsula_coast"
+
+
+def test_parse_with_rag_extracts_topology_modifiers() -> None:
+    elongated_island = parse_with_rag("一座狭长的四面环海岛屿。")
+    north_south_island = parse_with_rag("一座南北向狭长的四面环海岛屿。")
+    broad_rift = parse_with_rag("东西大陆中间被宽阔的大海隔开。")
+    dense_archipelago = parse_with_rag("中央是一片密集的群岛。")
+    branched_inland_sea = parse_with_rag("中间是一片多海湾的内海。")
+    rift_inland_sea = parse_with_rag("中间是一片裂谷式内海。")
+
+    assert elongated_island["topology_intent"]["modifiers"]["shape_bias"] == "elongated"
+    assert north_south_island["topology_intent"]["modifiers"]["shape_axis"] == "north_south"
+    assert broad_rift["topology_intent"]["modifiers"]["rift_width"] == "broad"
+    assert dense_archipelago["topology_intent"]["modifiers"]["island_density"] == "dense"
+    assert branched_inland_sea["topology_intent"]["modifiers"]["basin_shape"] == "branched"
+    assert rift_inland_sea["topology_intent"]["modifiers"]["basin_style"] == "rift"
 
 
 def test_parse_with_rag_can_select_modular_backend() -> None:
@@ -52,6 +113,7 @@ def test_parse_with_rag_enriches_middle_sea_split_prompt() -> None:
 
     assert {"west", "east"} <= positions
     assert "center" in plan["constraints"]["sea_zones"]
+    assert plan["topology_intent"]["kind"] == "two_continents_with_rift_sea"
 
 
 def test_parse_with_rag_enriches_inland_sea_enclosure_prompt() -> None:
@@ -61,6 +123,7 @@ def test_parse_with_rag_enriches_inland_sea_enclosure_prompt() -> None:
     assert {"north", "south"} <= positions
     assert plan["profile"]["sea_style"] == "inland"
     assert plan["inland_seas"]
+    assert plan["topology_intent"]["kind"] == "central_enclosed_inland_sea"
 
 
 def test_render_world_accepts_beta_module_structures() -> None:
@@ -171,6 +234,7 @@ def test_render_world_keeps_central_inland_sea_open() -> None:
     assert float(np.mean(centerline < 0.0)) > 0.82
     assert _shoreline_span_std(basin_window) > 1.2
     assert _mirrored_half_difference(basin_window) > 0.06
+    assert _count_large_water_components(central_basin < 0.0) == 1
 
 
 def test_render_world_supports_modular_backend() -> None:
@@ -205,6 +269,93 @@ def test_render_world_supports_modular_backend() -> None:
     assert arrays["elevation"].shape == (64, 96)
     assert np.nanmax(arrays["elevation"]) > 0.1
     assert np.nanmin(arrays["elevation"]) < -0.1
+
+
+def test_render_world_single_island_topology_keeps_dominant_center_mass() -> None:
+    plan = parse_with_rag("一座四面环海的岛屿。")
+
+    arrays, _ = render_world(plan, width=160, height=96, seed=23)
+    center_mass = arrays["elevation"][24:72, 46:114]
+    edge_ocean = np.concatenate(
+        [
+            arrays["elevation"][:14, :].ravel(),
+            arrays["elevation"][-14:, :].ravel(),
+            arrays["elevation"][:, :18].ravel(),
+            arrays["elevation"][:, -18:].ravel(),
+        ]
+    )
+
+    assert float(np.mean(center_mass > 0.0)) > 0.6
+    assert float(np.mean(edge_ocean < 0.0)) > 0.8
+    assert _count_large_land_components(arrays["elevation"]) == 1
+
+
+def test_render_world_rift_topology_keeps_two_dominant_landmasses() -> None:
+    plan = parse_with_rag("东西大陆中间被海隔开。")
+
+    arrays, _ = render_world(plan, width=160, height=96, seed=29)
+    west_midland = arrays["elevation"][34:62, 14:56]
+    east_midland = arrays["elevation"][34:62, 104:146]
+
+    assert _count_large_land_components(arrays["elevation"]) == 2
+    assert float(np.mean(west_midland > 0.0)) > 0.5
+    assert float(np.mean(east_midland > 0.0)) > 0.5
+
+
+def test_render_world_archipelago_topology_keeps_multiple_islands() -> None:
+    plan = parse_with_rag("中央是一片群岛。")
+
+    arrays, _ = render_world(plan, width=160, height=96, seed=31)
+
+    assert _count_large_land_components(arrays["elevation"], min_cells=20) >= 3
+
+
+def test_render_world_topology_modifiers_shift_geometry() -> None:
+    east_west_island, _ = render_world(parse_with_rag("一座东西向狭长的四面环海岛屿。"), width=160, height=96, seed=41)
+    north_south_island, _ = render_world(parse_with_rag("一座南北向狭长的四面环海岛屿。"), width=160, height=96, seed=41)
+    narrow_rift, _ = render_world(parse_with_rag("东西大陆中间被狭窄的海隔开。"), width=160, height=96, seed=43)
+    broad_rift, _ = render_world(parse_with_rag("东西大陆中间被宽阔的大海隔开。"), width=160, height=96, seed=43)
+    sparse_archipelago, _ = render_world(parse_with_rag("中央是一片稀疏的群岛。"), width=160, height=96, seed=47)
+    dense_archipelago, _ = render_world(parse_with_rag("中央是一片密集的群岛。"), width=160, height=96, seed=47)
+    compact_inland, _ = render_world(parse_with_rag("中间是一片紧凑的内海。"), width=160, height=96, seed=53)
+    broad_inland, _ = render_world(parse_with_rag("中间是一片宽阔的内海。"), width=160, height=96, seed=53)
+    branched_inland, _ = render_world(parse_with_rag("中间是一片多海湾的内海。"), width=160, height=96, seed=53)
+    rift_inland, _ = render_world(parse_with_rag("中间是一片裂谷式内海。"), width=160, height=96, seed=53)
+
+    east_west_land = east_west_island["elevation"] > 0.0
+    north_south_land = north_south_island["elevation"] > 0.0
+    ew_center_row = np.flatnonzero(east_west_land[48])
+    ew_center_col = np.flatnonzero(east_west_land[:, 80])
+    ns_center_row = np.flatnonzero(north_south_land[48])
+    ns_center_col = np.flatnonzero(north_south_land[:, 80])
+    east_west_row_span = float(ew_center_row[-1] - ew_center_row[0] + 1)
+    east_west_col_span = float(ew_center_col[-1] - ew_center_col[0] + 1)
+    north_south_row_span = float(ns_center_row[-1] - ns_center_row[0] + 1)
+    north_south_col_span = float(ns_center_col[-1] - ns_center_col[0] + 1)
+    narrow_window = narrow_rift["elevation"][:, 64:96]
+    broad_window = broad_rift["elevation"][:, 64:96]
+    compact_basin = compact_inland["elevation"][28:68, 48:112] < 0.0
+    broad_basin = broad_inland["elevation"][28:68, 48:112] < 0.0
+    branched_basin = branched_inland["elevation"][24:72, 38:122].T < 0.0
+
+    assert east_west_row_span > east_west_col_span + 4
+    assert float(np.mean(broad_window < 0.0)) > float(np.mean(narrow_window < 0.0)) + 0.05
+    assert _count_large_land_components(dense_archipelago["elevation"], min_cells=20) >= _count_large_land_components(
+        sparse_archipelago["elevation"],
+        min_cells=20,
+    )
+    assert float(np.mean(broad_basin)) > float(np.mean(compact_basin)) + 0.05
+    assert _shoreline_span_std(branched_basin) > _shoreline_span_std(compact_basin.T) + 0.6
+
+
+def test_render_world_peninsula_topology_keeps_connected_spur() -> None:
+    plan = parse_with_rag("东侧伸出一条半岛。")
+
+    arrays, _ = render_world(plan, width=160, height=96, seed=37)
+    east_spur = arrays["elevation"][28:70, 98:150]
+
+    assert float(np.mean(east_spur > 0.0)) > 0.35
+    assert _count_large_land_components(arrays["elevation"], min_cells=140) >= 1
 
 
 def test_build_world_plan_respects_explicit_backend_override() -> None:

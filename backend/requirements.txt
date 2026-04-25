@@ -22,3 +22,4 @@ zarr>=2.18,<3
 opensimplex==0.4.5.1
 pyfastnoiselite==0.0.7
 pyflwdir>=0.5.10
+pytest>=8.0,<9

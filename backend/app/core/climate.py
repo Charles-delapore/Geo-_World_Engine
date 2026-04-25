@@ -5,183 +5,69 @@ from typing import Dict
 
 import numpy as np
 
-try:
-    from numba import jit
-except ImportError:  # pragma: no cover - optional acceleration
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
 
-
-@jit(nopython=True)
 def calculate_temperature(
     elev: np.ndarray,
     latitude: np.ndarray,
     lapse_rate: float = 0.0065,
     temperature_bias: float = 0.0,
 ) -> np.ndarray:
-    """
-    根据海拔和纬度计算温度（摄氏度）
-    
-    Args:
-        elev: 高程数组（米）
-        latitude: 纬度数组（度，-90到90）
-        lapse_rate: 温度递减率（°C/m）
-        
-    Returns:
-        温度数组
-    """
-    # 基础温度：赤道约30°C，两极度低
-    # 使用余弦函数更平滑地模拟纬度影响
-    lat_rad = np.abs(latitude) * np.pi / 180.0  # 转换为弧度
+    lat_rad = np.abs(latitude) * np.pi / 180.0
     base_temp = 30.0 * np.cos(lat_rad)
-    
-    # 海拔递减（每升高1000米降低6.5°C）
     temp = base_temp - lapse_rate * elev + temperature_bias
-    
     return temp
 
 
-@jit(nopython=True)
 def calculate_precipitation(
-    elev: np.ndarray, 
+    elev: np.ndarray,
     wind_direction: str = 'westerly',
     moisture_factor: float = 1.0
 ) -> np.ndarray:
-    """
-    基于地形和风向计算降水（简化版）
-    
-    Args:
-        elev: 高程数组
-        wind_direction: 主导风向 ('westerly', 'easterly', 'northerly', 'southerly')
-        moisture_factor: 湿度因子
-        
-    Returns:
-        降水量数组（mm/年）
-    """
-    height, width = elev.shape
-    precip = np.ones((height, width), dtype=np.float32) * 1000.0  # 基础降水1000mm
-    
-    # 计算坡度（用于地形雨）
+    precip = np.full(elev.shape, 1000.0, dtype=np.float32)
+
     grad_y = np.zeros_like(elev)
     grad_x = np.zeros_like(elev)
-    
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
-            grad_y[y, x] = elev[y + 1, x] - elev[y - 1, x]
-            grad_x[y, x] = elev[y, x + 1] - elev[y, x - 1]
-    
-    # 根据风向调整降水
-    if wind_direction == 'westerly':
-        # 西风带：西侧迎风坡多雨
-        for y in range(height):
-            for x in range(width):
-                if grad_x[y, x] > 0:  # 西坡
-                    precip[y, x] *= 1.5
-                elif grad_x[y, x] < 0:  # 东坡（雨影）
-                    precip[y, x] *= 0.7
-    elif wind_direction == 'easterly':
-        for y in range(height):
-            for x in range(width):
-                if grad_x[y, x] < 0:
-                    precip[y, x] *= 1.45
-                elif grad_x[y, x] > 0:
-                    precip[y, x] *= 0.72
-    elif wind_direction == 'northerly':
-        for y in range(height):
-            for x in range(width):
-                if grad_y[y, x] > 0:
-                    precip[y, x] *= 1.35
-                elif grad_y[y, x] < 0:
-                    precip[y, x] *= 0.76
-    elif wind_direction == 'southerly':
-        for y in range(height):
-            for x in range(width):
-                if grad_y[y, x] < 0:
-                    precip[y, x] *= 1.35
-                elif grad_y[y, x] > 0:
-                    precip[y, x] *= 0.76
+    grad_y[1:-1, :] = elev[2:, :] - elev[:-2, :]
+    grad_x[:, 1:-1] = elev[:, 2:] - elev[:, :-2]
 
-    # 应用湿度因子
+    if wind_direction == 'westerly':
+        precip = np.where(grad_x > 0, precip * 1.5, np.where(grad_x < 0, precip * 0.7, precip))
+    elif wind_direction == 'easterly':
+        precip = np.where(grad_x < 0, precip * 1.45, np.where(grad_x > 0, precip * 0.72, precip))
+    elif wind_direction == 'northerly':
+        precip = np.where(grad_y > 0, precip * 1.35, np.where(grad_y < 0, precip * 0.76, precip))
+    elif wind_direction == 'southerly':
+        precip = np.where(grad_y < 0, precip * 1.35, np.where(grad_y > 0, precip * 0.76, precip))
+
     precip *= moisture_factor
-    
     return precip
 
 
-@jit(nopython=True)
 def classify_biome(temp: np.ndarray, precip: np.ndarray) -> np.ndarray:
-    """
-    基于温度和降水分类生物群系
-    
-    Args:
-        temp: 温度数组（°C）
-        precip: 降水量数组（mm/年）
-        
-    Returns:
-        生物群系ID数组
-        0: 海洋, 1: 沙漠, 2: 草原, 3: 森林, 4: 苔原, 5: 冰原
-    """
-    height, width = temp.shape
-    biome = np.zeros((height, width), dtype=np.int32)
-    
-    for y in range(height):
-        for x in range(width):
-            t = temp[y, x]
-            p = precip[y, x]
-            
-            if t < -10:
-                biome[y, x] = 5  # 冰原
-            elif t < 0:
-                biome[y, x] = 4  # 苔原
-            elif p < 250:
-                biome[y, x] = 1  # 沙漠
-            elif p < 500:
-                biome[y, x] = 2  # 草原
-            else:
-                biome[y, x] = 3  # 森林
-    
+    biome = np.zeros(temp.shape, dtype=np.int32)
+    biome = np.where(temp < -10, 5, biome)
+    biome = np.where((temp >= -10) & (temp < 0), 4, biome)
+    biome = np.where((temp >= 0) & (precip < 250), 1, biome)
+    biome = np.where((temp >= 0) & (temp >= 0) & (precip >= 250) & (precip < 500), 2, biome)
+    biome = np.where((temp >= 0) & (precip >= 500), 3, biome)
     return biome
 
 
 class ClimateSimulator:
-    """气候模拟器"""
-    
+
     def __init__(self, elev: np.ndarray, lat_grid: np.ndarray):
-        """
-        初始化气候模拟器
-        
-        Args:
-            elev: 高程数组
-            lat_grid: 纬度网格数组
-        """
         self.elev = elev
         self.lat_grid = lat_grid
-    
+
     def run(
         self,
         wind_direction: str = 'westerly',
         moisture_factor: float = 1.0,
         temperature_bias: float = 0.0,
     ) -> Dict[str, np.ndarray]:
-        """
-        运行气候模拟
-        
-        Args:
-            wind_direction: 主导风向
-            
-        Returns:
-            包含温度、降水、生物群系的字典
-        """
-        # 计算温度
         temp = calculate_temperature(self.elev, self.lat_grid, temperature_bias=temperature_bias)
-        
-        # 计算降水
         precip = calculate_precipitation(self.elev, wind_direction, moisture_factor)
-        
-        # 分类生物群系
         biome = classify_biome(temp, precip)
-        
         return {
             'temperature': temp,
             'precipitation': precip,

@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+import json
+import logging
+import tempfile
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
 
 from app.core.climate import ClimateSimulator
+from app.core.coast_naturalizer import naturalize_coastline
+from app.core.geometry_metrics import compute_metric_report, component_labels
 from app.core.terrain import TerrainGenerator
 from app.core.terrain_modular import ModularTerrainGenerator
+from app.core.topology_guard import TopologyGuard
+
+logger = logging.getLogger(__name__)
 
 
-def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[str, np.ndarray], Image.Image]:
+def render_world(
+    plan: dict,
+    width: int,
+    height: int,
+    seed: int,
+    emit_debug_artifacts: bool = False,
+) -> tuple[dict[str, np.ndarray], Image.Image]:
     backend = str((plan or {}).get("generation_backend") or "gaussian_voronoi")
     terrain = TerrainGenerator(width=width, height=height, seed=seed)
     if backend == "modular":
@@ -18,12 +34,28 @@ def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[s
 
     constraints = (plan or {}).get("constraints") or {}
     profile = (plan or {}).get("profile") or {}
+    topology_intent = (plan or {}).get("topology_intent") or {}
+    coast_complexity = float(profile.get("coast_complexity", 0.5))
+
     elevation, uses_hard_topology = _shape_world_profile(terrain, elevation, plan or {})
     if constraints:
         refinement_constraints = _constraints_for_refinement(constraints, profile, uses_hard_topology)
         if refinement_constraints and not uses_hard_topology:
             elevation = terrain.apply_constraints(elevation, refinement_constraints)
             elevation = terrain.reinforce_constraints(elevation, refinement_constraints, blend=0.66)
+
+    if topology_intent:
+        boundary_irregularity = float(topology_intent.get("boundary_irregularity", 0.5))
+        elevation = naturalize_coastline(
+            terrain, elevation,
+            boundary_irregularity=boundary_irregularity,
+            coast_complexity=coast_complexity,
+        )
+
+    guard = TopologyGuard(max_repair_strength=0.3)
+    elevation, guard_result = guard.repair(elevation, topology_intent if topology_intent else None)
+    if guard_result.repairs:
+        logger.info("TopologyGuard repairs for seed=%s: %s", seed, guard_result.repairs)
 
     filled = elevation
     latitude = np.linspace(90.0, -90.0, height, dtype=np.float32).reshape(height, 1)
@@ -39,6 +71,14 @@ def render_world(plan: dict, width: int, height: int, seed: int) -> tuple[dict[s
         "precipitation": climate["precipitation"].astype(np.float32),
         "biome": climate["biome"].astype(np.int16),
     }
+
+    metric_report = compute_metric_report(filled, topology_intent if topology_intent else None)
+    metric_report["topology_guard"] = guard_result.to_dict()
+    arrays["metric_report"] = json.dumps(metric_report, ensure_ascii=False).encode("utf-8")
+
+    if emit_debug_artifacts:
+        _emit_debug_artifacts(arrays, topology_intent)
+
     preview = render_preview_from_arrays(arrays, profile)
     return arrays, preview
 
@@ -63,6 +103,7 @@ def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, plan:
     island_factor = float(profile.get("island_factor", 0.25))
     layout_template = str(profile.get("layout_template", "default"))
     sea_style = str(profile.get("sea_style", "open"))
+    topology_intent = plan.get("topology_intent") or {}
 
     macro = terrain._fbm(scale=145.0, octaves=4, persistence=0.56, lacunarity=2.05, offset=77.0)
     ridges = terrain._ridged_noise(scale=54.0, octaves=4, offset=31.0)
@@ -78,7 +119,7 @@ def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, plan:
     else:
         shaped = _apply_constraint_topology(terrain, shaped, constraints, coast_complexity, ruggedness)
 
-    if not explicit_geometry:
+    if not explicit_geometry and not topology_intent:
         shaped = _apply_layout_template(terrain, shaped, layout_template, sea_style, constraints, coast_complexity)
     shaped = _apply_constraint_topology(terrain, shaped, constraints, coast_complexity, ruggedness)
     shaped += (macro * 2.0 - 1.0) * (0.14 + coast_complexity * 0.12)
@@ -90,6 +131,7 @@ def _shape_world_profile(terrain: TerrainGenerator, elevation: np.ndarray, plan:
     shaped = np.tanh(shaped * (0.9 + ruggedness * 0.55)).astype(np.float32)
     shaped = terrain.apply_coastal_smoothing(shaped, sea_level=0.0, smoothing_radius=max(3, int(8 - coast_complexity * 4)))
     shaped = _enforce_required_water_gaps(terrain, shaped, plan)
+    shaped = _enforce_topology_components(terrain, shaped, plan)
     return np.clip(shaped, -1.0, 1.0).astype(np.float32), uses_hard_topology
 
 
@@ -242,11 +284,16 @@ def _build_hard_topology(
 def _has_explicit_plan_geometry(plan: dict) -> bool:
     return any(
         plan.get(key)
-        for key in ("continents", "mountains", "peninsulas", "island_chains", "inland_seas", "water_bodies", "regional_relations")
+        for key in ("continents", "mountains", "peninsulas", "island_chains", "inland_seas", "water_bodies", "regional_relations", "topology_intent")
     )
 
 
 def _build_plan_structural_topology(terrain: TerrainGenerator, plan: dict, ruggedness: float) -> np.ndarray | None:
+    topology_intent = plan.get("topology_intent") or {}
+    intent_field = _build_topology_intent_field(terrain, topology_intent, ruggedness)
+    if intent_field is not None:
+        return intent_field
+
     continents = list(plan.get("continents") or [])
     mountains = list(plan.get("mountains") or [])
     peninsulas = list(plan.get("peninsulas") or [])
@@ -303,6 +350,233 @@ def _build_plan_structural_topology(terrain: TerrainGenerator, plan: dict, rugge
 
     field = _apply_mountain_topology(terrain, field, {"mountains": mountains or constraints.get("mountains") or []}, ruggedness)
     field = _apply_regional_relations(terrain, field, regional_relations)
+    return _normalize_topology(field)
+
+
+def _build_topology_intent_field(terrain: TerrainGenerator, topology_intent: dict, ruggedness: float) -> np.ndarray | None:
+    kind = str(topology_intent.get("kind", "")).strip().lower()
+    if kind == "single_island":
+        return _build_single_island_intent_topology(terrain, ruggedness, topology_intent)
+    if kind == "archipelago_chain":
+        return _build_archipelago_intent_topology(terrain, ruggedness, topology_intent)
+    if kind == "peninsula_coast":
+        return _build_peninsula_intent_topology(terrain, ruggedness, topology_intent)
+    if kind == "two_continents_with_rift_sea":
+        return _build_two_continents_rift_topology(terrain, ruggedness, topology_intent)
+    if kind == "central_enclosed_inland_sea":
+        return _build_central_inland_sea_intent_topology(terrain, ruggedness, topology_intent)
+    return None
+
+
+def _build_single_island_intent_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
+    shape_bias = _intent_modifier(topology_intent, "shape_bias", "balanced")
+    shape_axis = _intent_modifier(topology_intent, "shape_axis", "east_west")
+    if shape_bias == "elongated":
+        skeleton = _single_island_axis_skeleton(terrain, axis=shape_axis)
+        width_envelope = _single_island_axis_width_envelope(terrain, axis=shape_axis, strong=False)
+        landform_mask = _single_island_axis_landform_mask(terrain, axis=shape_axis, strong=False)
+        cross_lobes = _single_island_axis_cross_lobes(terrain, axis=shape_axis)
+        core = np.maximum.reduce([skeleton, width_envelope * 0.92, landform_mask * 0.86, cross_lobes * 0.58])
+        bite_masks = _single_island_axis_carve(terrain, axis=shape_axis, strong=False)
+        bite_scale = 1.18
+    elif shape_bias == "round":
+        core = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.5, 0.5, 0.19, 0.19, 0.0),
+                terrain._elliptic_gaussian(0.46, 0.56, 0.1, 0.1, 0.0) * 0.66,
+                terrain._elliptic_gaussian(0.56, 0.43, 0.095, 0.095, 0.0) * 0.64,
+            ]
+        )
+        bite_scale = 0.84
+        bite_masks = np.maximum.reduce(
+            [
+                terrain._create_location_mask("west", radius=0.18, sigma=0.42) * 0.2,
+                terrain._create_location_mask("east", radius=0.16, sigma=0.38) * 0.16,
+                terrain._create_location_mask("south", radius=0.14, sigma=0.36) * 0.12,
+            ]
+        )
+    else:
+        core = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.52, 0.48, 0.19, 0.16, -0.2),
+                terrain._elliptic_gaussian(0.47, 0.55, 0.15, 0.19, 0.28),
+                terrain._elliptic_gaussian(0.57, 0.42, 0.11, 0.13, -0.44) * 0.74,
+            ]
+        )
+        bite_scale = 1.0
+        bite_masks = np.maximum.reduce(
+            [
+                terrain._create_location_mask("west", radius=0.18, sigma=0.42) * 0.2,
+                terrain._create_location_mask("east", radius=0.16, sigma=0.38) * 0.16,
+                terrain._create_location_mask("south", radius=0.14, sigma=0.36) * 0.12,
+            ]
+        )
+    coastal_noise = terrain._fbm(scale=52.0, octaves=4, persistence=0.56, lacunarity=2.05, offset=805.0)
+    irregular = np.clip(core * (0.86 + coastal_noise * 0.26), 0.0, 1.0)
+    island = terrain._shoreline_profile(irregular, water_level=0.4, gain=1.86)
+    ocean_bites = bite_masks * bite_scale
+    field = island * 1.32 - ocean_bites
+    if shape_bias == "elongated" and shape_axis == "north_south":
+        outer_ocean = _single_island_axis_outer_ocean(terrain, axis=shape_axis, width_envelope=width_envelope)
+        field -= outer_ocean * 1.18
+        field -= np.clip(1.0 - landform_mask * 1.16, 0.0, 1.0) * 0.32
+    return _normalize_topology(np.tanh((field * 2.0 - 1.0) * (1.06 + ruggedness * 0.1)))
+
+
+def _build_archipelago_intent_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
+    density = _intent_modifier(topology_intent, "island_density", "balanced")
+    archipelago = np.zeros((terrain.height, terrain.width), dtype=np.float32)
+    if density == "dense":
+        island_specs = [
+            ("west", 0.082, 0.0, 0.76),
+            ("east", 0.08, 0.18, 0.72),
+            ("northwest", 0.072, -0.32, 0.66),
+            ("northeast", 0.07, 0.28, 0.64),
+            ("southwest", 0.074, 0.14, 0.68),
+            ("southeast", 0.068, -0.22, 0.62),
+            ("center", 0.062, 0.08, 0.58),
+        ]
+        ocean_scale = 0.72
+    elif density == "sparse":
+        island_specs = [
+            ("west", 0.075, -0.08, 0.62),
+            ("east", 0.07, 0.24, 0.58),
+            ("northwest", 0.062, -0.34, 0.52),
+            ("southeast", 0.06, -0.2, 0.48),
+        ]
+        ocean_scale = 1.16
+    else:
+        island_specs = [
+            ("west", 0.085, 0.0, 0.7),
+            ("east", 0.082, 0.18, 0.66),
+            ("northwest", 0.074, -0.32, 0.6),
+            ("northeast", 0.07, 0.28, 0.56),
+            ("southwest", 0.076, 0.14, 0.62),
+            ("southeast", 0.068, -0.22, 0.54),
+            ("center", 0.058, 0.08, 0.42),
+        ]
+        ocean_scale = 1.0
+    for position, size, rotation, weight in island_specs:
+        cy, cx = terrain._resolve_position(position)
+        island = terrain._elliptic_gaussian(cy, cx, size * 0.8, size * 0.55, rotation)
+        archipelago = np.maximum(archipelago, island.astype(np.float32) * weight)
+    scatter_noise = terrain._fbm(scale=41.0, octaves=4, persistence=0.57, lacunarity=2.1, offset=1091.0)
+    archipelago = np.clip(archipelago * (0.78 + scatter_noise * 0.24), 0.0, 1.0)
+    separated_ocean = np.maximum.reduce(
+        [
+            terrain._create_location_mask("center", radius=0.18, sigma=0.52) * 0.2 * ocean_scale,
+            terrain._elliptic_gaussian(0.5, 0.5, 0.08, 0.34, 0.0) * 0.16 * ocean_scale,
+        ]
+    )
+    field = archipelago * 1.1 - separated_ocean
+    return _normalize_topology(np.tanh((field * 2.0 - 1.0) * (0.96 + ruggedness * 0.06)))
+
+
+def _build_peninsula_intent_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
+    notes = " ".join(topology_intent.get("notes") or [])
+    anchor = "east"
+    for candidate in ("west", "east", "north", "south"):
+        if candidate in notes:
+            anchor = candidate
+            break
+
+    mainland = {
+        "east": np.maximum(
+            terrain._elliptic_gaussian(0.5, 0.23, 0.3, 0.22, -0.08),
+            terrain._elliptic_gaussian(0.34, 0.29, 0.16, 0.12, 0.24) * 0.72,
+        ),
+        "west": np.maximum(
+            terrain._elliptic_gaussian(0.5, 0.77, 0.3, 0.22, 0.08),
+            terrain._elliptic_gaussian(0.66, 0.7, 0.16, 0.12, -0.24) * 0.72,
+        ),
+        "north": np.maximum(
+            terrain._elliptic_gaussian(0.24, 0.5, 0.22, 0.3, 0.04),
+            terrain._elliptic_gaussian(0.3, 0.66, 0.12, 0.16, 0.34) * 0.72,
+        ),
+        "south": np.maximum(
+            terrain._elliptic_gaussian(0.76, 0.5, 0.22, 0.3, -0.04),
+            terrain._elliptic_gaussian(0.7, 0.34, 0.12, 0.16, -0.34) * 0.72,
+        ),
+    }[anchor]
+    peninsula = _plan_peninsula_component(terrain, anchor, 0.24) * 1.18
+    coastal_bite = {
+        "east": terrain._create_location_mask("east", radius=0.18, sigma=0.42) * 0.18,
+        "west": terrain._create_location_mask("west", radius=0.18, sigma=0.42) * 0.18,
+        "north": terrain._create_location_mask("north", radius=0.18, sigma=0.42) * 0.18,
+        "south": terrain._create_location_mask("south", radius=0.18, sigma=0.42) * 0.18,
+    }[anchor]
+    shape_noise = terrain._fbm(scale=49.0, octaves=3, persistence=0.56, lacunarity=2.08, offset=1139.0)
+    land = np.clip(np.maximum(mainland, peninsula) * (0.86 + shape_noise * 0.22), 0.0, 1.0)
+    field = land * 1.28 - coastal_bite
+    return _normalize_topology(np.tanh((field * 2.0 - 1.0) * (1.0 + ruggedness * 0.08)))
+
+
+def _build_two_continents_rift_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
+    rift_width = _intent_modifier(topology_intent, "rift_width", "balanced")
+    rift_profile = _intent_modifier(topology_intent, "rift_profile", "natural")
+    west = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.52, 0.24, 0.26, 0.17, -0.18),
+            terrain._elliptic_gaussian(0.36, 0.3, 0.15, 0.12, 0.34) * 0.74,
+            terrain._elliptic_gaussian(0.71, 0.18, 0.14, 0.11, -0.26) * 0.68,
+        ]
+    )
+    east = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.48, 0.76, 0.24, 0.18, 0.22),
+            terrain._elliptic_gaussian(0.33, 0.69, 0.13, 0.1, -0.32) * 0.72,
+            terrain._elliptic_gaussian(0.67, 0.82, 0.13, 0.1, 0.28) * 0.64,
+        ]
+    )
+    west = np.clip(west * (0.88 + terrain._fbm(scale=58.0, octaves=3, persistence=0.55, lacunarity=2.0, offset=847.0) * 0.18), 0.0, 1.0)
+    east = np.clip(east * (0.9 + terrain._fbm(scale=61.0, octaves=3, persistence=0.57, lacunarity=2.02, offset=883.0) * 0.18), 0.0, 1.0)
+    width_scale = {"narrow": 0.78, "balanced": 1.0, "broad": 1.3}.get(rift_width, 1.0)
+    strength = {"narrow": 0.96, "balanced": 1.1, "broad": 1.3}.get(rift_width, 1.1)
+    rift = _natural_split_barrier(terrain, axis="vertical", width_scale=width_scale)
+    if rift_profile == "broken":
+        rift = np.maximum(
+            rift,
+            np.maximum.reduce(
+                [
+                    terrain._elliptic_gaussian(0.34, 0.49, 0.08, 0.07, -0.18) * 0.74,
+                    terrain._elliptic_gaussian(0.58, 0.52, 0.1, 0.08, 0.24) * 0.88,
+                    terrain._elliptic_gaussian(0.79, 0.47, 0.065, 0.06, -0.08) * 0.62,
+                ]
+            ),
+        )
+        strength += 0.08
+    elif rift_profile == "smooth":
+        strength -= 0.08
+    field = np.maximum(west, east) * 1.34 - rift * strength
+    return _normalize_topology(field)
+
+
+def _build_central_inland_sea_intent_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
+    basin_shape = _intent_modifier(topology_intent, "basin_shape", "balanced")
+    basin_style = _intent_modifier(topology_intent, "basin_style", "balanced")
+    north = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.24, 0.46, 0.17, 0.29, -0.12),
+            terrain._elliptic_gaussian(0.31, 0.68, 0.12, 0.16, 0.34) * 0.76,
+        ]
+    )
+    south = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.76, 0.54, 0.18, 0.27, 0.16),
+            terrain._elliptic_gaussian(0.67, 0.31, 0.11, 0.15, -0.28) * 0.72,
+        ]
+    )
+    west_shoulder = terrain._elliptic_gaussian(0.53, 0.25, 0.1, 0.13, -0.5) * 0.62
+    east_shoulder = terrain._elliptic_gaussian(0.47, 0.76, 0.08, 0.12, 0.44) * 0.48
+    basin = _natural_inland_sea_basin(terrain, basin_shape=basin_shape, basin_style=basin_style)
+    if basin_style == "rift":
+        west_shoulder *= 0.44
+        east_shoulder *= 0.4
+    elif basin_style == "mediterranean":
+        west_shoulder *= 0.8
+        east_shoulder *= 0.8
+    land = np.maximum.reduce([north, south, west_shoulder, east_shoulder])
+    field = land * 1.28 - basin * {"compact": 0.92, "balanced": 1.05, "broad": 1.2, "branched": 1.14}.get(basin_shape, 1.05)
     return _normalize_topology(field)
 
 
@@ -648,8 +922,452 @@ def _force_water_mask(
     return shaped
 
 
-def _natural_split_barrier(terrain: TerrainGenerator, axis: str) -> np.ndarray:
-    channel = _meandering_channel_mask(terrain, axis=axis, center=0.495, width=0.05, waviness=0.04, skew=0.05)
+def _enforce_topology_components(terrain: TerrainGenerator, elevation: np.ndarray, plan: dict) -> np.ndarray:
+    topology_intent = plan.get("topology_intent") or {}
+    kind = str(topology_intent.get("kind", "")).strip().lower()
+    if kind == "single_island":
+        return _enforce_single_dominant_landmass(terrain, elevation, topology_intent)
+    if kind == "archipelago_chain":
+        return _enforce_archipelago_islands(terrain, elevation, topology_intent)
+    if kind == "two_continents_with_rift_sea":
+        return _enforce_two_dominant_landmasses(terrain, elevation, topology_intent)
+    if kind == "central_enclosed_inland_sea":
+        return _enforce_central_inland_sea_basin(terrain, elevation, plan)
+    return elevation
+
+
+def _enforce_single_dominant_landmass(terrain: TerrainGenerator, elevation: np.ndarray, topology_intent: dict | None = None) -> np.ndarray:
+    land_mask = elevation > 0.0
+    labels, counts = _label_land_components(land_mask)
+    if len(counts) <= 1:
+        shaped = elevation.astype(np.float32).copy()
+    else:
+        dominant_label = max(counts, key=counts.get)
+        dominant_mask = labels == dominant_label
+        component_noise = terrain._fbm(scale=42.0, octaves=3, persistence=0.58, lacunarity=2.02, offset=941.0) * 2.0 - 1.0
+        edge_band = gaussian_smooth(dominant_mask.astype(np.float32))
+
+        shaped = elevation.astype(np.float32).copy()
+        stray_mask = land_mask & ~dominant_mask
+        shaped[stray_mask] = np.minimum(shaped[stray_mask], (-0.12 + component_noise[stray_mask] * 0.04).astype(np.float32))
+        shaped = np.maximum(shaped, ((edge_band - 0.42) * 0.26).astype(np.float32))
+
+    ring_ocean = np.clip(
+        terrain._create_location_mask("west", radius=0.18, sigma=0.48) * 0.08
+        + terrain._create_location_mask("east", radius=0.18, sigma=0.48) * 0.08
+        + terrain._create_location_mask("north", radius=0.16, sigma=0.42) * 0.06
+        + terrain._create_location_mask("south", radius=0.16, sigma=0.42) * 0.06,
+        0.0,
+        0.2,
+    )
+    shaped -= ring_ocean.astype(np.float32)
+    intent = topology_intent or {}
+    if _intent_modifier(intent, "shape_bias", "balanced") == "elongated":
+        shape_axis = _intent_modifier(intent, "shape_axis", "east_west")
+        spine = _single_island_axis_skeleton(terrain, axis=shape_axis, strong=True)
+        width_envelope = _single_island_axis_width_envelope(terrain, axis=shape_axis, strong=True)
+        landform_mask = _single_island_axis_landform_mask(terrain, axis=shape_axis, strong=True)
+        shoulders = _single_island_axis_cross_lobes(terrain, axis=shape_axis)
+        spine = np.maximum.reduce([spine, width_envelope, landform_mask * 0.84, shoulders * 0.36])
+        carve = _single_island_axis_carve(terrain, axis=shape_axis, strong=True)
+        spine_target = ((spine - 0.28) * (0.54 if shape_axis == "north_south" else 0.42)).astype(np.float32)
+        spine_mask = spine >= (0.22 if shape_axis == "north_south" else 0.27)
+        shaped[spine_mask] = np.maximum(shaped[spine_mask], spine_target[spine_mask])
+        if shape_axis == "north_south":
+            envelope_cap = ((np.maximum(spine, width_envelope * 0.96) - 0.34) * 0.62).astype(np.float32)
+            shaped = np.minimum(shaped, envelope_cap)
+            outer_corridor = landform_mask < 0.24
+            shaped[outer_corridor] = np.minimum(
+                shaped[outer_corridor],
+                (-0.14 - (0.24 - landform_mask[outer_corridor]) * 0.52).astype(np.float32),
+            )
+            shaped = _force_water_mask(shaped, carve, base_depth=-0.18, mask_threshold=0.32)
+            lateral_ocean = _single_island_axis_outer_ocean(terrain, axis=shape_axis, width_envelope=width_envelope)
+            shaped = _force_water_mask(shaped, lateral_ocean, base_depth=-0.16, mask_threshold=0.44)
+            hard_ocean = lateral_ocean >= 0.34
+            shaped[hard_ocean] = np.minimum(shaped[hard_ocean], (-0.18 - lateral_ocean[hard_ocean] * 0.36).astype(np.float32))
+            shaped[spine_mask] = np.maximum(shaped[spine_mask], spine_target[spine_mask])
+        else:
+            shaped -= carve.astype(np.float32)
+    shaped = gaussian_smooth(shaped)
+    if _intent_modifier(intent, "shape_bias", "balanced") == "elongated":
+        shaped = _apply_single_island_axis_final_shape(
+            terrain,
+            shaped,
+            axis=_intent_modifier(intent, "shape_axis", "east_west"),
+        )
+    return shaped
+
+
+def _single_island_axis_skeleton(terrain: TerrainGenerator, axis: str, strong: bool = False) -> np.ndarray:
+    if axis == "north_south":
+        if strong:
+            return np.maximum.reduce(
+                [
+                    terrain._elliptic_gaussian(0.5, 0.5, 0.4, 0.048, 0.0),
+                    terrain._elliptic_gaussian(0.26, 0.49, 0.17, 0.045, -0.03) * 0.88,
+                    terrain._elliptic_gaussian(0.75, 0.52, 0.18, 0.048, 0.05) * 0.9,
+                ]
+            )
+        return np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.5, 0.5, 0.34, 0.07, 0.0),
+                terrain._elliptic_gaussian(0.3, 0.49, 0.16, 0.06, -0.04) * 0.8,
+                terrain._elliptic_gaussian(0.71, 0.52, 0.17, 0.065, 0.06) * 0.82,
+            ]
+        )
+    if strong:
+        return np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.5, 0.5, 0.048, 0.4, 0.0),
+                terrain._elliptic_gaussian(0.49, 0.26, 0.045, 0.17, -0.03) * 0.88,
+                terrain._elliptic_gaussian(0.52, 0.75, 0.048, 0.18, 0.05) * 0.9,
+            ]
+        )
+    return np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.5, 0.5, 0.07, 0.34, 0.0),
+            terrain._elliptic_gaussian(0.49, 0.3, 0.06, 0.16, -0.04) * 0.8,
+            terrain._elliptic_gaussian(0.52, 0.71, 0.065, 0.17, 0.06) * 0.82,
+        ]
+    )
+
+
+def _single_island_axis_width_envelope(terrain: TerrainGenerator, axis: str, strong: bool) -> np.ndarray:
+    y = terrain._y_norm
+    x = terrain._x_norm
+    if axis == "north_south":
+        centerline = 0.5 + (y - 0.5) * 0.035 + np.sin((y - 0.5) * np.pi * 2.1) * (0.018 if strong else 0.014)
+        width = (0.068 if strong else 0.082) + np.exp(-((y - 0.5) ** 2) / 0.08) * (0.034 if strong else 0.042)
+        mask = np.exp(-((x - centerline) ** 2) / np.maximum(width**2, 1e-4))
+        length_gate = np.exp(-((y - 0.5) ** 2) / (0.18 if strong else 0.22))
+        tip_caps = np.maximum(
+            terrain._elliptic_gaussian(0.22, 0.49, 0.12, 0.05, -0.04) * 0.74,
+            terrain._elliptic_gaussian(0.79, 0.53, 0.13, 0.052, 0.05) * 0.76,
+        )
+    else:
+        centerline = 0.5 + (x - 0.5) * 0.03 + np.sin((x - 0.5) * np.pi * 2.1) * (0.018 if strong else 0.014)
+        width = (0.068 if strong else 0.082) + np.exp(-((x - 0.5) ** 2) / 0.08) * (0.034 if strong else 0.042)
+        mask = np.exp(-((y - centerline) ** 2) / np.maximum(width**2, 1e-4))
+        length_gate = np.exp(-((x - 0.5) ** 2) / (0.18 if strong else 0.22))
+        tip_caps = np.maximum(
+            terrain._elliptic_gaussian(0.49, 0.22, 0.05, 0.12, -0.04) * 0.74,
+            terrain._elliptic_gaussian(0.53, 0.79, 0.052, 0.13, 0.05) * 0.76,
+        )
+    envelope = gaussian_smooth(np.clip(mask * length_gate, 0.0, 1.0).astype(np.float32))
+    return np.maximum(envelope, tip_caps.astype(np.float32))
+
+
+def _single_island_axis_cross_lobes(terrain: TerrainGenerator, axis: str) -> np.ndarray:
+    if axis == "north_south":
+        return np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.42, 0.43, 0.09, 0.12, -0.3) * 0.76,
+                terrain._elliptic_gaussian(0.58, 0.57, 0.1, 0.13, 0.22) * 0.8,
+            ]
+        )
+    return np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.43, 0.42, 0.12, 0.09, -0.3) * 0.76,
+            terrain._elliptic_gaussian(0.57, 0.58, 0.13, 0.1, 0.22) * 0.8,
+        ]
+    )
+
+
+def _single_island_axis_landform_mask(terrain: TerrainGenerator, axis: str, strong: bool) -> np.ndarray:
+    width_envelope = _single_island_axis_width_envelope(terrain, axis=axis, strong=strong)
+    skeleton = _single_island_axis_skeleton(terrain, axis=axis, strong=strong)
+    if axis == "north_south":
+        north_cap = terrain._elliptic_gaussian(0.18, 0.49, 0.11 if strong else 0.1, 0.06 if strong else 0.07, -0.05) * 0.72
+        south_cap = terrain._elliptic_gaussian(0.82, 0.53, 0.12 if strong else 0.11, 0.06 if strong else 0.07, 0.06) * 0.74
+        center_fill = terrain._elliptic_gaussian(0.5, 0.5, 0.3 if strong else 0.27, 0.08 if strong else 0.095, 0.0) * 0.58
+    else:
+        north_cap = terrain._elliptic_gaussian(0.49, 0.18, 0.06 if strong else 0.07, 0.11 if strong else 0.1, -0.05) * 0.72
+        south_cap = terrain._elliptic_gaussian(0.53, 0.82, 0.06 if strong else 0.07, 0.12 if strong else 0.11, 0.06) * 0.74
+        center_fill = terrain._elliptic_gaussian(0.5, 0.5, 0.08 if strong else 0.095, 0.3 if strong else 0.27, 0.0) * 0.58
+    return gaussian_smooth(np.maximum.reduce([width_envelope, skeleton * 0.92, center_fill, north_cap, south_cap]).astype(np.float32))
+
+
+def _single_island_axis_outer_ocean(terrain: TerrainGenerator, axis: str, width_envelope: np.ndarray) -> np.ndarray:
+    if axis == "north_south":
+        along_axis = 0.5 + np.exp(-((terrain._y_norm - 0.5) ** 2) / 0.16) * 0.5
+        outside = np.clip((1.0 - np.clip(width_envelope * 1.42, 0.0, 0.96)) * along_axis, 0.0, 1.0)
+        flank_bias = np.maximum(
+            terrain._create_location_mask("west", radius=0.24, sigma=0.5) * 0.34,
+            terrain._create_location_mask("east", radius=0.24, sigma=0.5) * 0.34,
+        )
+        return gaussian_smooth(np.maximum(outside, flank_bias).astype(np.float32))
+    along_axis = 0.46 + np.exp(-((terrain._x_norm - 0.5) ** 2) / 0.18) * 0.42
+    outside = np.clip((1.0 - np.clip(width_envelope * 1.38, 0.0, 0.96)) * along_axis, 0.0, 1.0)
+    flank_bias = np.maximum(
+        terrain._create_location_mask("north", radius=0.22, sigma=0.48) * 0.24,
+        terrain._create_location_mask("south", radius=0.22, sigma=0.48) * 0.24,
+    )
+    return gaussian_smooth(np.maximum(outside, flank_bias).astype(np.float32))
+
+
+def _apply_single_island_axis_final_shape(terrain: TerrainGenerator, elevation: np.ndarray, axis: str) -> np.ndarray:
+    if axis != "north_south":
+        return elevation
+    width_envelope = _single_island_axis_width_envelope(terrain, axis=axis, strong=True)
+    spine = _single_island_axis_skeleton(terrain, axis=axis, strong=True)
+    landform_mask = _single_island_axis_landform_mask(terrain, axis=axis, strong=True)
+    lateral_ocean = _single_island_axis_outer_ocean(terrain, axis=axis, width_envelope=width_envelope)
+    shaped = elevation.astype(np.float32).copy()
+    target_land = ((np.maximum(spine * 1.06, landform_mask) - 0.31) * 0.74).astype(np.float32)
+    corridor_mask = landform_mask >= 0.3
+    shaped[corridor_mask] = np.maximum(shaped[corridor_mask], target_land[corridor_mask])
+    envelope_cap = ((np.maximum.reduce([spine, width_envelope, landform_mask * 0.92]) - 0.42) * 0.54).astype(np.float32)
+    shaped = np.minimum(shaped, envelope_cap)
+    outside_mask = landform_mask < 0.3
+    shaped[outside_mask] = np.minimum(
+        shaped[outside_mask],
+        (-0.2 - (0.3 - landform_mask[outside_mask]) * 0.62).astype(np.float32),
+    )
+    hard_ocean = lateral_ocean >= 0.28
+    shaped[hard_ocean] = np.minimum(shaped[hard_ocean], (-0.22 - lateral_ocean[hard_ocean] * 0.34).astype(np.float32))
+    spine_mask = spine >= 0.2
+    spine_target = ((spine - 0.26) * 0.56).astype(np.float32)
+    shaped[spine_mask] = np.maximum(shaped[spine_mask], spine_target[spine_mask])
+    return gaussian_smooth(shaped)
+
+
+def _single_island_axis_carve(terrain: TerrainGenerator, axis: str, strong: bool) -> np.ndarray:
+    if axis == "north_south":
+        return np.maximum.reduce(
+            [
+                terrain._create_location_mask("west", radius=0.24 if strong else 0.2, sigma=0.52 if strong else 0.44) * (0.3 if strong else 0.24),
+                terrain._create_location_mask("east", radius=0.24 if strong else 0.2, sigma=0.52 if strong else 0.44) * (0.28 if strong else 0.22),
+                terrain._elliptic_gaussian(0.5, 0.24, 0.2 if strong else 0.18, 0.075 if strong else 0.08, 0.0) * (0.2 if strong else 0.16),
+                terrain._elliptic_gaussian(0.5, 0.76, 0.2 if strong else 0.18, 0.075 if strong else 0.08, 0.0) * (0.2 if strong else 0.16),
+            ]
+        )
+    return np.maximum.reduce(
+        [
+            terrain._create_location_mask("north", radius=0.18 if strong else 0.16, sigma=0.44 if strong else 0.4) * (0.14 if strong else 0.1),
+            terrain._create_location_mask("south", radius=0.18 if strong else 0.16, sigma=0.44 if strong else 0.4) * (0.14 if strong else 0.1),
+        ]
+    )
+
+
+def _enforce_archipelago_islands(terrain: TerrainGenerator, elevation: np.ndarray, topology_intent: dict) -> np.ndarray:
+    density = _intent_modifier(topology_intent, "island_density", "balanced")
+    shaped = elevation.astype(np.float32).copy()
+    target_components = 4 if density == "dense" else 3
+    if _count_components_from_mask(shaped > 0.0, min_cells=90 if density != "sparse" else 70) >= target_components:
+        return shaped
+
+    core_specs = [
+        (0.38, 0.33, 0.08, 0.06, -0.24, 0.92),
+        (0.62, 0.54, 0.075, 0.06, 0.2, 0.88),
+        (0.45, 0.72, 0.07, 0.055, -0.18, 0.84),
+        (0.66, 0.24, 0.065, 0.05, 0.28, 0.78),
+    ]
+    if density == "dense":
+        core_specs.extend(
+            [
+                (0.32, 0.57, 0.055, 0.045, 0.14, 0.68),
+                (0.57, 0.36, 0.05, 0.04, -0.22, 0.64),
+            ]
+        )
+    island_cores = np.maximum.reduce(
+        [terrain._elliptic_gaussian(cy, cx, ry, rx, rotation) * weight for cy, cx, ry, rx, rotation, weight in core_specs]
+    )
+    core_target = ((island_cores - 0.36) * 0.4).astype(np.float32)
+    core_mask = island_cores >= 0.34
+    shaped[core_mask] = np.maximum(shaped[core_mask], core_target[core_mask])
+
+    channels = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.5, 0.5, 0.08, 0.28, 0.0),
+            terrain._elliptic_gaussian(0.5, 0.5, 0.22, 0.05, 0.0) * 0.92,
+            terrain._elliptic_gaussian(0.42, 0.38, 0.05, 0.16, -0.4),
+            terrain._elliptic_gaussian(0.58, 0.63, 0.05, 0.16, 0.38),
+            terrain._elliptic_gaussian(0.44, 0.64, 0.05, 0.15, 0.2),
+            terrain._elliptic_gaussian(0.56, 0.44, 0.045, 0.14, -0.28),
+        ]
+    )
+    if density == "sparse":
+        channels = np.maximum(channels, terrain._elliptic_gaussian(0.51, 0.52, 0.12, 0.34, 0.06) * 0.78)
+    channels = _naturalize_water_mask(
+        terrain,
+        channels,
+        amplitude=0.2 if density == "sparse" else 0.16,
+        smooth_passes=2,
+        asymmetry=0.1,
+        axis="vertical",
+    )
+    shaped = _force_water_mask(
+        shaped,
+        channels,
+        base_depth=-0.27 if density == "sparse" else -0.22,
+        mask_threshold=0.46 if density == "dense" else 0.5,
+    )
+    shaped[core_mask] = np.maximum(shaped[core_mask], core_target[core_mask])
+    return np.clip(shaped, -1.0, 1.0).astype(np.float32)
+
+
+def _enforce_two_dominant_landmasses(terrain: TerrainGenerator, elevation: np.ndarray, topology_intent: dict) -> np.ndarray:
+    rift_width = _intent_modifier(topology_intent, "rift_width", "balanced")
+    rift_profile = _intent_modifier(topology_intent, "rift_profile", "natural")
+    land_mask = elevation > 0.0
+    labels, counts = _label_land_components(land_mask)
+    if len(counts) <= 2:
+        shaped = elevation.astype(np.float32).copy()
+    else:
+        sorted_labels = sorted(counts, key=counts.get, reverse=True)
+        keep_labels = set(sorted_labels[:2])
+        keep_mask = np.isin(labels, list(keep_labels))
+        stray_mask = land_mask & ~keep_mask
+        shaped = elevation.astype(np.float32).copy()
+        removal_noise = terrain._fbm(scale=39.0, octaves=3, persistence=0.56, lacunarity=2.08, offset=977.0) * 2.0 - 1.0
+        shaped[stray_mask] = np.minimum(shaped[stray_mask], (-0.1 + removal_noise[stray_mask] * 0.05).astype(np.float32))
+
+    # Reinforce north-south continental continuity on both sides so the rift sea
+    # does not accidentally create a horizontal cross-cut through the continents.
+    west_spine = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.5, 0.23, 0.34, 0.09, -0.08),
+            terrain._elliptic_gaussian(0.34, 0.28, 0.15, 0.08, 0.22) * 0.74,
+            terrain._elliptic_gaussian(0.69, 0.19, 0.16, 0.07, -0.16) * 0.68,
+        ]
+    )
+    east_spine = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.5, 0.77, 0.34, 0.09, 0.1),
+            terrain._elliptic_gaussian(0.31, 0.72, 0.14, 0.08, -0.2) * 0.72,
+            terrain._elliptic_gaussian(0.66, 0.82, 0.15, 0.07, 0.16) * 0.66,
+        ]
+    )
+    continental_spines = np.maximum(west_spine, east_spine)
+    spine_target = ((continental_spines - 0.38) * 0.44).astype(np.float32)
+    spine_mask = continental_spines >= 0.32
+    shaped[spine_mask] = np.maximum(shaped[spine_mask], spine_target[spine_mask])
+
+    # Suppress horizontal sea intrusion across the middle band on both continents.
+    west_midland = terrain._elliptic_gaussian(0.5, 0.24, 0.1, 0.18, 0.02) * 0.72
+    east_midland = terrain._elliptic_gaussian(0.5, 0.76, 0.1, 0.18, -0.03) * 0.72
+    midland = np.maximum(west_midland, east_midland)
+    midland_target = ((midland - 0.36) * 0.34).astype(np.float32)
+    midland_mask = midland >= 0.34
+    shaped[midland_mask] = np.maximum(shaped[midland_mask], midland_target[midland_mask])
+
+    # Keep the central rift open so removed fragments do not reconnect the two main continents.
+    width_scale = {"narrow": 0.78, "balanced": 1.0, "broad": 1.3}.get(rift_width, 1.0)
+    rift_mask = _natural_split_barrier(terrain, axis="vertical", width_scale=width_scale)
+    if rift_profile == "broken":
+        rift_mask = np.maximum(
+            rift_mask,
+            np.maximum.reduce(
+                [
+                    terrain._elliptic_gaussian(0.35, 0.48, 0.075, 0.07, -0.14) * 0.72,
+                    terrain._elliptic_gaussian(0.62, 0.53, 0.095, 0.075, 0.18) * 0.84,
+                ]
+            ),
+        )
+    shaped = _force_water_mask(
+        shaped,
+        rift_mask,
+        base_depth={"narrow": -0.26, "balanced": -0.3, "broad": -0.36}.get(rift_width, -0.3) - (0.03 if rift_profile == "broken" else 0.0),
+        mask_threshold={"narrow": 0.6, "balanced": 0.56, "broad": 0.5}.get(rift_width, 0.56) - (0.03 if rift_profile == "broken" else 0.0),
+    )
+    return gaussian_smooth(shaped)
+
+
+def _enforce_central_inland_sea_basin(terrain: TerrainGenerator, elevation: np.ndarray, plan: dict) -> np.ndarray:
+    inland_seas = list(plan.get("inland_seas") or [])
+    topology_intent = plan.get("topology_intent") or {}
+    basin_shape = _intent_modifier(topology_intent, "basin_shape", "balanced")
+    basin_style = _intent_modifier(topology_intent, "basin_style", "balanced")
+    connection = str((inland_seas[0] if inland_seas else {}).get("connection", "enclosed")).lower()
+    shaped = elevation.astype(np.float32).copy()
+
+    basin_mask = _natural_inland_sea_basin(terrain, basin_shape=basin_shape, basin_style=basin_style)
+    shaped = _force_water_mask(
+        shaped,
+        basin_mask,
+        base_depth={"compact": -0.24, "balanced": -0.28, "broad": -0.32, "branched": -0.29}.get(basin_shape, -0.28),
+        mask_threshold={"compact": 0.58, "balanced": 0.52, "broad": 0.46, "branched": 0.5}.get(basin_shape, 0.52),
+    )
+
+    outer_ring = np.maximum.reduce(
+        [
+            terrain._elliptic_gaussian(0.5, 0.5, 0.22, 0.34, 0.02),
+            terrain._elliptic_gaussian(0.5, 0.5, 0.18, 0.3, -0.04) * 0.9,
+        ]
+    )
+    rim_seed = np.clip(outer_ring - basin_mask * 0.92, 0.0, 1.0)
+    rim_noise = terrain._fbm(scale=57.0, octaves=3, persistence=0.57, lacunarity=2.02, offset=1019.0) * 2.0 - 1.0
+    rim_mask = np.clip(rim_seed * (0.9 + rim_noise * 0.18), 0.0, 1.0)
+
+    if "strait" in connection:
+        opening = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.49, 0.76, 0.045, 0.08, 0.22),
+                terrain._elliptic_gaussian(0.53, 0.7, 0.04, 0.06, -0.1) * 0.75,
+            ]
+        )
+        rim_mask = np.clip(rim_mask - opening * 0.9, 0.0, 1.0)
+        shaped = _force_water_mask(shaped, opening, base_depth=-0.22, mask_threshold=0.58)
+    elif "east" in connection or "open" in connection:
+        outlet = terrain._elliptic_gaussian(0.5, 0.82, 0.05, 0.1, 0.08)
+        rim_mask = np.clip(rim_mask - outlet * 0.86, 0.0, 1.0)
+        shaped = _force_water_mask(shaped, outlet, base_depth=-0.24, mask_threshold=0.56)
+
+    land_target = ((rim_mask - 0.42) * 0.42).astype(np.float32)
+    strong_rim = rim_mask >= 0.34
+    shaped[strong_rim] = np.maximum(shaped[strong_rim], land_target[strong_rim])
+
+    labels, counts = _label_water_components(shaped < 0.0)
+    central_window = np.zeros_like(shaped, dtype=bool)
+    h, w = shaped.shape
+    central_window[int(h * 0.25) : int(h * 0.75), int(w * 0.28) : int(w * 0.72)] = True
+    keep_water = np.zeros_like(shaped, dtype=bool)
+    for component_id, size in counts.items():
+        component = labels == component_id
+        if np.any(component & central_window):
+            keep_water |= component
+    stray_water = (shaped < 0.0) & central_window & ~keep_water
+    shaped[stray_water] = np.maximum(shaped[stray_water], 0.04)
+    return gaussian_smooth(shaped)
+
+
+def _label_land_components(mask: np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+    from scipy.ndimage import label
+
+    labels, count = label(mask.astype(np.int8))
+    component_sizes = {component_id: int(np.sum(labels == component_id)) for component_id in range(1, count + 1)}
+    return labels.astype(np.int32), component_sizes
+
+
+def _label_water_components(mask: np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+    from scipy.ndimage import label
+
+    labels, count = label(mask.astype(np.int8))
+    component_sizes = {component_id: int(np.sum(labels == component_id)) for component_id in range(1, count + 1)}
+    return labels.astype(np.int32), component_sizes
+
+
+def _count_components_from_mask(mask: np.ndarray, min_cells: int) -> int:
+    from scipy.ndimage import label
+
+    labels, count = label(mask.astype(np.int8))
+    kept = 0
+    for component_id in range(1, count + 1):
+        if int(np.sum(labels == component_id)) >= min_cells:
+            kept += 1
+    return kept
+
+
+def _natural_split_barrier(terrain: TerrainGenerator, axis: str, width_scale: float = 1.0) -> np.ndarray:
+    channel = _meandering_channel_mask(
+        terrain,
+        axis=axis,
+        center=0.495,
+        width=0.05 * width_scale,
+        waviness=0.04,
+        skew=0.05,
+    )
     connector = _natural_strait_connector(terrain, axis=axis)
     mask = np.maximum(channel, connector * 0.9)
     if axis == "vertical":
@@ -672,24 +1390,93 @@ def _natural_split_barrier(terrain: TerrainGenerator, axis: str) -> np.ndarray:
     return _naturalize_water_mask(terrain, mask, amplitude=0.23, smooth_passes=2, asymmetry=0.14, axis=axis)
 
 
-def _natural_inland_sea_basin(terrain: TerrainGenerator) -> np.ndarray:
-    basin = np.maximum.reduce(
-        [
-            terrain._elliptic_gaussian(0.46, 0.42, 0.11, 0.14, -0.24),
-            terrain._elliptic_gaussian(0.54, 0.6, 0.1, 0.18, 0.22),
-            terrain._elliptic_gaussian(0.49, 0.53, 0.075, 0.22, 0.11) * 0.9,
-            terrain._elliptic_gaussian(0.52, 0.47, 0.055, 0.26, -0.08) * 0.62,
-        ]
-    )
-    coves = np.maximum.reduce(
-        [
-            terrain._elliptic_gaussian(0.39, 0.33, 0.055, 0.12, -0.72) * 0.8,
-            terrain._elliptic_gaussian(0.61, 0.68, 0.045, 0.09, 0.44) * 0.58,
-            terrain._elliptic_gaussian(0.47, 0.74, 0.04, 0.085, 0.3) * 0.54,
-            terrain._elliptic_gaussian(0.56, 0.24, 0.05, 0.075, -0.4) * 0.46,
-        ]
-    )
+def _intent_modifier(topology_intent: dict, key: str, default: str) -> str:
+    modifiers = topology_intent.get("modifiers") or {}
+    value = str(modifiers.get(key, default)).strip().lower()
+    return value or default
+
+
+def _natural_inland_sea_basin(terrain: TerrainGenerator, basin_shape: str = "balanced", basin_style: str = "balanced") -> np.ndarray:
+    if basin_shape == "compact":
+        basin = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.47, 0.45, 0.085, 0.11, -0.18),
+                terrain._elliptic_gaussian(0.54, 0.57, 0.075, 0.12, 0.16),
+                terrain._elliptic_gaussian(0.5, 0.51, 0.06, 0.16, 0.08) * 0.84,
+            ]
+        )
+        coves = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.43, 0.35, 0.035, 0.08, -0.64) * 0.46,
+                terrain._elliptic_gaussian(0.58, 0.65, 0.03, 0.07, 0.36) * 0.38,
+            ]
+        )
+    elif basin_shape == "broad":
+        basin = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.46, 0.4, 0.13, 0.16, -0.2),
+                terrain._elliptic_gaussian(0.55, 0.62, 0.12, 0.21, 0.24),
+                terrain._elliptic_gaussian(0.49, 0.53, 0.09, 0.28, 0.08) * 0.94,
+                terrain._elliptic_gaussian(0.52, 0.47, 0.07, 0.31, -0.06) * 0.7,
+            ]
+        )
+        coves = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.39, 0.31, 0.06, 0.14, -0.72) * 0.82,
+                terrain._elliptic_gaussian(0.62, 0.7, 0.05, 0.11, 0.42) * 0.64,
+                terrain._elliptic_gaussian(0.46, 0.76, 0.045, 0.1, 0.26) * 0.58,
+                terrain._elliptic_gaussian(0.58, 0.22, 0.055, 0.09, -0.36) * 0.5,
+            ]
+        )
+    elif basin_shape == "branched":
+        basin = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.47, 0.43, 0.1, 0.13, -0.22),
+                terrain._elliptic_gaussian(0.55, 0.6, 0.095, 0.16, 0.2),
+                terrain._elliptic_gaussian(0.5, 0.52, 0.07, 0.24, 0.1) * 0.9,
+                terrain._elliptic_gaussian(0.52, 0.48, 0.05, 0.28, -0.04) * 0.68,
+            ]
+        )
+        coves = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.36, 0.34, 0.05, 0.13, -0.82) * 0.88,
+                terrain._elliptic_gaussian(0.63, 0.69, 0.04, 0.11, 0.52) * 0.72,
+                terrain._elliptic_gaussian(0.45, 0.77, 0.038, 0.11, 0.28) * 0.68,
+                terrain._elliptic_gaussian(0.56, 0.23, 0.045, 0.1, -0.46) * 0.62,
+                terrain._elliptic_gaussian(0.52, 0.61, 0.03, 0.09, 0.14) * 0.58,
+            ]
+        )
+    else:
+        basin = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.46, 0.42, 0.11, 0.14, -0.24),
+                terrain._elliptic_gaussian(0.54, 0.6, 0.1, 0.18, 0.22),
+                terrain._elliptic_gaussian(0.49, 0.53, 0.075, 0.22, 0.11) * 0.9,
+                terrain._elliptic_gaussian(0.52, 0.47, 0.055, 0.26, -0.08) * 0.62,
+            ]
+        )
+        coves = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.39, 0.33, 0.055, 0.12, -0.72) * 0.8,
+                terrain._elliptic_gaussian(0.61, 0.68, 0.045, 0.09, 0.44) * 0.58,
+                terrain._elliptic_gaussian(0.47, 0.74, 0.04, 0.085, 0.3) * 0.54,
+                terrain._elliptic_gaussian(0.56, 0.24, 0.05, 0.075, -0.4) * 0.46,
+            ]
+        )
     mask = np.maximum(basin, coves)
+    if basin_style == "rift":
+        rift_core = np.maximum.reduce(
+            [
+                terrain._elliptic_gaussian(0.49, 0.47, 0.05, 0.22, -0.08),
+                terrain._elliptic_gaussian(0.53, 0.56, 0.045, 0.2, 0.12) * 0.86,
+                terrain._elliptic_gaussian(0.45, 0.37, 0.04, 0.16, -0.2) * 0.68,
+            ]
+        )
+        mask = np.maximum(mask * 0.9, rift_core)
+    elif basin_style == "mediterranean":
+        west_bay = terrain._elliptic_gaussian(0.5, 0.32, 0.065, 0.12, -0.12) * 0.76
+        east_bay = terrain._elliptic_gaussian(0.5, 0.69, 0.06, 0.14, 0.14) * 0.72
+        mask = np.maximum(mask, np.maximum(west_bay, east_bay))
     return _naturalize_water_mask(terrain, mask, amplitude=0.2, smooth_passes=3, asymmetry=0.18, axis="vertical")
 
 
@@ -910,3 +1697,17 @@ def _render_preview_image(
 
     image = np.clip(palette, 0, 255).astype(np.uint8)
     return Image.fromarray(image, mode="RGB")
+
+
+def _emit_debug_artifacts(arrays: dict[str, np.ndarray], topology_intent: dict) -> None:
+    try:
+        elevation = arrays.get("elevation")
+        if elevation is None:
+            return
+        land_mask = (elevation > 0.0).astype(np.uint8) * 255
+        water_mask = (elevation <= 0.0).astype(np.uint8) * 255
+        labels = component_labels(elevation > 0.0, min_cells=20)
+        label_vis = (labels % 7 * 36).astype(np.uint8)
+        logger.info("Debug artifacts: land_mask/water_mask/labels shape=%s", elevation.shape)
+    except Exception as exc:
+        logger.warning("Failed to emit debug artifacts: %s", exc)

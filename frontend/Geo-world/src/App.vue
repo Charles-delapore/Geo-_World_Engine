@@ -30,8 +30,15 @@ async function handleSubmit(payload: TaskFormPayload) {
     taskId.value = created.taskId
     task.value = created
     startPolling()
-  } catch (error) {
-    submitError.value = error instanceof Error ? error.message : '创建任务失败'
+  } catch (error: unknown) {
+    if (error && typeof error === 'object' && 'response' in error) {
+      const axiosError = error as { response?: { status?: number; data?: unknown }; message?: string }
+      const status = axiosError.response?.status
+      const data = axiosError.response?.data
+      submitError.value = `请求失败 (${status || '未知'}): ${typeof data === 'object' ? JSON.stringify(data) : String(data || axiosError.message || '未知错误')}`
+    } else {
+      submitError.value = error instanceof Error ? error.message : '创建任务失败'
+    }
   } finally {
     isSubmitting.value = false
   }
