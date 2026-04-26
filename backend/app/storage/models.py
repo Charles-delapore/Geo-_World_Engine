@@ -10,6 +10,13 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
 
+_HAS_GEOALCHEMY2 = False
+try:
+    from geoalchemy2 import Geometry
+    _HAS_GEOALCHEMY2 = True
+except ImportError:
+    pass
+
 
 class Base(DeclarativeBase):
     pass
@@ -59,6 +66,19 @@ class TaskTransition(Base):
     to_state: Mapped[str] = mapped_column(Text)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+if _HAS_GEOALCHEMY2:
+    class TerrainGeometry(Base):
+        __tablename__ = "terrain_geometries"
+
+        id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+        task_id: Mapped[str] = mapped_column(Text, index=True)
+        geometry_type: Mapped[str] = mapped_column(Text)
+        label: Mapped[str | None] = mapped_column(Text, nullable=True)
+        properties: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+        geom = mapped_column(Geometry(geometry_type="GEOMETRY", srid=4326), nullable=True)
+        created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}

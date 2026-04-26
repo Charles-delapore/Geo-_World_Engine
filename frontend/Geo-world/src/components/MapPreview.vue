@@ -13,8 +13,5 @@ defineProps<{
       :src="previewUrl"
       alt="World preview"
     />
-    <div v-else class="placeholder-card">
-      <p>静态预览图尚未就绪。</p>
-    </div>
   </div>
 </template>

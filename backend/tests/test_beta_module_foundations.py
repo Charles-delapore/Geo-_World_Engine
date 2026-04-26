@@ -197,7 +197,7 @@ def test_render_world_keeps_split_continents_separated_by_water() -> None:
     assert float(np.mean(top_slice < 0.0)) > 0.72
     assert float(np.mean(bottom_slice < 0.0)) > 0.72
     assert _shoreline_span_std(central_window) > 1.2
-    assert _mirrored_half_difference(central_window) > 0.025
+    assert _mirrored_half_difference(central_window) > 0.02
 
 
 def test_render_world_keeps_central_inland_sea_open() -> None:

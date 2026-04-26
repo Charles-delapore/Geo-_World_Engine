@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     MAX_WIDTH: int = 2048
     MAX_HEIGHT: int = 1024
     DEFAULT_TILE_SIZE: int = 256
-    MAX_TILE_ZOOM: int = 0
+    MAX_TILE_ZOOM: int = 4
     DEFAULT_AUTO_CONFIRM: bool = True
     DEFAULT_GENERATE_TILES: bool = True
     ENABLE_BACKGROUND_PIPELINE: bool = True

@@ -22,6 +22,8 @@ async function ensureMap() {
     throw new Error('加载瓦片 manifest 失败')
   }
   const manifest = await response.json()
+  const sourceMaxZoom = manifest.max_zoom ?? 4
+  const sourceMinZoom = manifest.min_zoom ?? 0
 
   if (!map) {
     map = new maplibregl.Map({
@@ -32,9 +34,18 @@ async function ensureMap() {
         layers: [],
       },
       center: manifest.center ?? [0, 0],
-      zoom: 0.5,
+      zoom: sourceMinZoom,
+      minZoom: sourceMinZoom,
+      maxZoom: sourceMaxZoom + 2,
+      scrollZoom: true,
+      dragPan: true,
+      dragRotate: true,
+      renderWorldCopies: true,
+      pitch: 0,
+      bearing: 0,
     })
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right')
+    map.scrollZoom.enable()
     map.on('load', () => {
       if (!map) {
         return
@@ -43,8 +54,8 @@ async function ensureMap() {
         type: 'raster',
         tiles: [manifest.tile_url_template],
         tileSize: 256,
-        minzoom: manifest.min_zoom ?? 0,
-        maxzoom: manifest.max_zoom ?? 0,
+        minzoom: sourceMinZoom,
+        maxzoom: sourceMaxZoom,
       })
       map.addLayer({
         id: 'beta-tiles-layer',
@@ -55,10 +66,21 @@ async function ensureMap() {
     return
   }
 
-  const source = map.getSource('beta-tiles') as maplibregl.RasterTileSource | undefined
-  if (source && 'setTiles' in source) {
-    source.setTiles([manifest.tile_url_template])
-  }
+  if (map.getLayer('beta-tiles-layer')) map.removeLayer('beta-tiles-layer')
+  if (map.getSource('beta-tiles')) map.removeSource('beta-tiles')
+  map.addSource('beta-tiles', {
+    type: 'raster',
+    tiles: [manifest.tile_url_template],
+    tileSize: 256,
+    minzoom: sourceMinZoom,
+    maxzoom: sourceMaxZoom,
+  })
+  map.addLayer({
+    id: 'beta-tiles-layer',
+    type: 'raster',
+    source: 'beta-tiles',
+  })
+  map.setMaxZoom(sourceMaxZoom + 2)
 }
 
 watch(

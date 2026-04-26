@@ -504,6 +504,21 @@ def _build_topology_intent(user_prompt: str, constraints: MapConstraints, profil
             "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.5)),
         }
 
+    if landform_class == "supercontinent":
+        return {
+            "kind": "single_island",
+            "landform_mode": "supercontinent",
+            "sea_mode": "open_ocean",
+            "exact_landmass_count": 1,
+            "forbid_cross_cut": True,
+            "notes": ["one massive continent", "avoid fragmentation", "high land ratio"],
+            "modifiers": modifiers,
+            "target_land_component_count": 1,
+            "target_water_component_count": 1,
+            "symmetry_break": 0.4,
+            "boundary_irregularity": float(modifiers.get("boundary_irregularity", 0.6)),
+        }
+
     if profile.sea_style == "inland" and ("center" in constraints.sea_zones or not constraints.sea_zones):
         return {
             "kind": "central_enclosed_inland_sea",

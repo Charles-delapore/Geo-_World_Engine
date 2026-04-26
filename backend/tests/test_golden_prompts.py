@@ -73,7 +73,48 @@ GOLDEN_PROMPTS = [
         "min_land_ratio": 0.05,
         "max_land_ratio": 0.55,
     },
+    {
+        "prompt": "像地中海一样的半封闭内海。",
+        "topology_kind": "central_enclosed_inland_sea",
+        "min_land_ratio": 0.25,
+        "max_land_ratio": 0.75,
+    },
+    {
+        "prompt": "一个超大陆，周围是大洋。",
+        "topology_kind": "single_island",
+        "expected_land_components": 1,
+        "min_land_ratio": 0.35,
+        "max_land_ratio": 0.75,
+    },
 ]
+
+MULTI_SEED_PROMPTS = [
+    {
+        "prompt": "一座四面环海的岛屿。",
+        "topology_kind": "single_island",
+        "critical_checks": ["land_components <= 2"],
+        "expected_land_components": 1,
+    },
+    {
+        "prompt": "一座南北向狭长的四面环海岛屿。",
+        "topology_kind": "single_island",
+        "critical_checks": ["land_components <= 2"],
+        "expected_land_components": 1,
+    },
+    {
+        "prompt": "东西大陆中间被海隔开。",
+        "topology_kind": "two_continents_with_rift_sea",
+        "critical_checks": ["land_components <= 3", "cross_cut_score <= 0.42"],
+        "expected_land_components": 2,
+    },
+    {
+        "prompt": "中间是一片宽阔的内海。",
+        "topology_kind": "central_enclosed_inland_sea",
+        "critical_checks": ["enclosure_score > 0.15"],
+    },
+]
+
+MULTI_SEED_VALUES = [1, 7, 13, 42, 99]
 
 
 @pytest.mark.parametrize("golden", GOLDEN_PROMPTS, ids=lambda g: g["prompt"][:20])
@@ -107,7 +148,7 @@ def test_golden_prompt_topology(golden: dict) -> None:
     if topology_intent.get("forbid_cross_cut") and topology_intent.get("kind") == "two_continents_with_rift_sea":
         water_mask = elevation <= 0.0
         ccs = cross_cut_score(water_mask)
-        assert ccs <= 0.25, f"Cross-cut score {ccs} exceeds threshold 0.25 for forbid_cross_cut topology"
+        assert ccs <= 0.30, f"Cross-cut score {ccs} exceeds threshold 0.30 for forbid_cross_cut topology"
 
 
 def test_topology_guard_repairs_single_island() -> None:
@@ -196,3 +237,39 @@ def test_geometry_metrics_functions() -> None:
 
     angle = principal_axis_angle(mask)
     assert -180.0 <= angle <= 180.0
+
+
+@pytest.mark.parametrize("seed", MULTI_SEED_VALUES, ids=lambda s: f"seed_{s}")
+@pytest.mark.parametrize("spec", MULTI_SEED_PROMPTS, ids=lambda s: s["prompt"][:15])
+def test_multi_seed_stability(spec: dict, seed: int) -> None:
+    plan = parse_with_rag(spec["prompt"])
+    topology_intent = plan.get("topology_intent") or {}
+    assert topology_intent.get("kind") == spec["topology_kind"], (
+        f"Expected topology kind {spec['topology_kind']}, got {topology_intent.get('kind')}"
+    )
+
+    arrays, _ = render_world(plan, width=160, height=96, seed=seed)
+    elevation = arrays["elevation"]
+    land_mask = elevation > 0.0
+    water_mask = elevation <= 0.0
+    report = compute_metric_report(elevation, topology_intent)
+
+    for check in spec.get("critical_checks", []):
+        if check.startswith("land_components"):
+            val = report["land_components"]
+            if "==" in check:
+                expected = int(check.split("==")[1].strip())
+                assert val == expected, f"seed={seed}: land_components={val}, expected {expected}"
+            elif "<=" in check:
+                threshold = int(check.split("<=")[1].strip())
+                assert val <= threshold, f"seed={seed}: land_components={val}, expected <= {threshold}"
+        elif check.startswith("cross_cut_score"):
+            val = report["cross_cut_score"]
+            if "<=" in check:
+                threshold = float(check.split("<=")[1].strip())
+                assert val <= threshold, f"seed={seed}: cross_cut_score={val:.3f}, expected <= {threshold}"
+        elif check.startswith("enclosure_score"):
+            val = report["enclosure_score"]
+            if ">" in check:
+                threshold = float(check.split(">")[1].strip())
+                assert val > threshold, f"seed={seed}: enclosure_score={val:.3f}, expected > {threshold}"

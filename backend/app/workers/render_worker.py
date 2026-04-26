@@ -18,12 +18,50 @@ from app.core.topology_guard import TopologyGuard
 logger = logging.getLogger(__name__)
 
 
+def _generate_region_elevation(
+    width: int, height: int, seed: int,
+    region_slice: tuple[slice, slice],
+    blend_width: int = 12,
+) -> np.ndarray:
+    h, w = height, width
+    region_terrain = TerrainGenerator(width=w, height=h, seed=seed)
+    region_elev = region_terrain.generate()
+    full = np.zeros((h, w), dtype=np.float32)
+    rs, cs = region_slice
+    full[rs, cs] = region_elev[rs, cs]
+    if blend_width > 0:
+        row_start = rs.start or 0
+        row_end = rs.stop or h
+        col_start = cs.start or 0
+        col_end = cs.stop or w
+        for i in range(blend_width):
+            alpha = i / blend_width
+            if row_start > 0:
+                r = row_start + i
+                if r < h:
+                    full[r, :] *= alpha
+            if row_end < h:
+                r = row_end - 1 - i
+                if r >= 0:
+                    full[r, :] *= alpha
+            if col_start > 0:
+                c = col_start + i
+                if c < w:
+                    full[:, c] *= alpha
+            if col_end < w:
+                c = col_end - 1 - i
+                if c >= 0:
+                    full[:, c] *= alpha
+    return full
+
+
 def render_world(
     plan: dict,
     width: int,
     height: int,
     seed: int,
     emit_debug_artifacts: bool = False,
+    task_id: str | None = None,
 ) -> tuple[dict[str, np.ndarray], Image.Image]:
     backend = str((plan or {}).get("generation_backend") or "gaussian_voronoi")
     terrain = TerrainGenerator(width=width, height=height, seed=seed)
@@ -36,6 +74,7 @@ def render_world(
     profile = (plan or {}).get("profile") or {}
     topology_intent = (plan or {}).get("topology_intent") or {}
     coast_complexity = float(profile.get("coast_complexity", 0.5))
+    ruggedness = float(profile.get("ruggedness", 0.55))
 
     elevation, uses_hard_topology = _shape_world_profile(terrain, elevation, plan or {})
     if constraints:
@@ -51,11 +90,57 @@ def render_world(
             boundary_irregularity=boundary_irregularity,
             coast_complexity=coast_complexity,
         )
+        try:
+            from app.core.coast_naturalizer import enforce_fractal_dimension
+            target_fd = 1.10 + coast_complexity * 0.12
+            elevation = enforce_fractal_dimension(
+                terrain, elevation,
+                target_fd=target_fd,
+                tolerance=0.10,
+                max_iterations=1,
+                coast_complexity=coast_complexity,
+            )
+        except Exception as exc:
+            logger.warning("Fractal dimension enforcement skipped: %s", exc)
 
     guard = TopologyGuard(max_repair_strength=0.3)
     elevation, guard_result = guard.repair(elevation, topology_intent if topology_intent else None)
     if guard_result.repairs:
         logger.info("TopologyGuard repairs for seed=%s: %s", seed, guard_result.repairs)
+
+    if ruggedness > 0.3:
+        try:
+            from app.core.hydrology_advanced import curvature_guided_erosion, multi_scale_erosion
+            erosion_strength = min(ruggedness * 0.6, 0.35)
+            elevation = curvature_guided_erosion(
+                elevation,
+                iterations=2,
+                erosion_rate=0.015 * erosion_strength,
+                ridge_protection=0.75,
+            )
+            elevation = multi_scale_erosion(
+                elevation,
+                scales=[1, 3],
+                base_rate=0.008 * erosion_strength,
+            )
+        except Exception as exc:
+            logger.warning("Curvature-guided erosion skipped: %s", exc)
+
+    try:
+        from app.core.terrain_analysis import compute_multi_scale_tpi
+        mstpi = compute_multi_scale_tpi(elevation, scales=[3, 9])
+        tpi_fine = mstpi["tpi_3"]
+        tpi_coarse = mstpi["tpi_9"]
+        tpi_combined = tpi_fine * 0.6 + tpi_coarse * 0.4
+        tpi_norm = tpi_combined / (np.std(tpi_combined) + 1e-10)
+        ridge_mask = tpi_norm > 2.0
+        valley_mask = tpi_norm < -2.0
+        land = elevation > 0
+        elevation[ridge_mask & land] *= 1.0 + 0.01 * ruggedness
+        elevation[valley_mask & land] *= 1.0 - 0.005 * ruggedness
+        elevation = np.clip(elevation, -1.0, 1.0).astype(np.float32)
+    except Exception as exc:
+        logger.warning("Multi-scale TPI feedback skipped: %s", exc)
 
     filled = elevation
     latitude = np.linspace(90.0, -90.0, height, dtype=np.float32).reshape(height, 1)
@@ -76,8 +161,8 @@ def render_world(
     metric_report["topology_guard"] = guard_result.to_dict()
     arrays["metric_report"] = json.dumps(metric_report, ensure_ascii=False).encode("utf-8")
 
-    if emit_debug_artifacts:
-        _emit_debug_artifacts(arrays, topology_intent)
+    if emit_debug_artifacts and task_id:
+        _emit_debug_artifacts(arrays, topology_intent, task_id)
 
     preview = render_preview_from_arrays(arrays, profile)
     return arrays, preview
@@ -514,22 +599,51 @@ def _build_peninsula_intent_topology(terrain: TerrainGenerator, ruggedness: floa
 def _build_two_continents_rift_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
     rift_width = _intent_modifier(topology_intent, "rift_width", "balanced")
     rift_profile = _intent_modifier(topology_intent, "rift_profile", "natural")
-    west = np.maximum.reduce(
-        [
-            terrain._elliptic_gaussian(0.52, 0.24, 0.26, 0.17, -0.18),
-            terrain._elliptic_gaussian(0.36, 0.3, 0.15, 0.12, 0.34) * 0.74,
-            terrain._elliptic_gaussian(0.71, 0.18, 0.14, 0.11, -0.26) * 0.68,
-        ]
+    h, w = terrain.height, terrain.width
+    base_seed = terrain._rng.integers(0, 2**31) if hasattr(terrain, '_rng') else 42
+    rng = terrain._rng if hasattr(terrain, '_rng') else np.random.RandomState(42)
+
+    west_seed = (base_seed * 7 + 13) % (2**31)
+    east_seed = (base_seed * 11 + 97) % (2**31)
+    west_region = _generate_region_elevation(
+        w, h, west_seed,
+        (slice(0, h), slice(0, int(w * 0.52))),
+        blend_width=8,
     )
-    east = np.maximum.reduce(
-        [
-            terrain._elliptic_gaussian(0.48, 0.76, 0.24, 0.18, 0.22),
-            terrain._elliptic_gaussian(0.33, 0.69, 0.13, 0.1, -0.32) * 0.72,
-            terrain._elliptic_gaussian(0.67, 0.82, 0.13, 0.1, 0.28) * 0.64,
-        ]
+    east_region = _generate_region_elevation(
+        w, h, east_seed,
+        (slice(0, h), slice(int(w * 0.48), w)),
+        blend_width=8,
     )
-    west = np.clip(west * (0.88 + terrain._fbm(scale=58.0, octaves=3, persistence=0.55, lacunarity=2.0, offset=847.0) * 0.18), 0.0, 1.0)
-    east = np.clip(east * (0.9 + terrain._fbm(scale=61.0, octaves=3, persistence=0.57, lacunarity=2.02, offset=883.0) * 0.18), 0.0, 1.0)
+
+    w_cy = 0.52 + (rng.random() - 0.5) * 0.04
+    e_cy = 0.48 + (rng.random() - 0.5) * 0.04
+    w_ry = 0.17 + (rng.random() - 0.5) * 0.03
+    e_ry = 0.18 + (rng.random() - 0.5) * 0.03
+    west_mask = np.clip(west_region * 3.0 + terrain._elliptic_gaussian(w_cy, 0.24, 0.26, w_ry, -0.18) * 0.5, 0.0, 1.0)
+    east_mask = np.clip(east_region * 3.0 + terrain._elliptic_gaussian(e_cy, 0.76, 0.24, e_ry, 0.22) * 0.5, 0.0, 1.0)
+
+    west_noise = terrain._fbm(scale=58.0, octaves=4, persistence=0.55, lacunarity=2.0, offset=847.0)
+    east_noise = terrain._fbm(scale=61.0, octaves=4, persistence=0.57, lacunarity=2.02, offset=883.0)
+    west = np.clip(west_mask * (0.82 + west_noise * 0.22), 0.0, 1.0)
+    east = np.clip(east_mask * (0.84 + east_noise * 0.22), 0.0, 1.0)
+
+    west *= _longitudinal_gate(terrain, "west")
+    east *= _longitudinal_gate(terrain, "east")
+
+    w_lobe1_y = 0.36 + (rng.random() - 0.5) * 0.04
+    w_lobe2_y = 0.71 + (rng.random() - 0.5) * 0.04
+    e_lobe1_y = 0.33 + (rng.random() - 0.5) * 0.04
+    e_lobe2_y = 0.67 + (rng.random() - 0.5) * 0.04
+    west += terrain._elliptic_gaussian(w_lobe1_y, 0.3, 0.15, 0.12, 0.34) * 0.74
+    west += terrain._elliptic_gaussian(w_lobe2_y, 0.18, 0.14, 0.11, -0.26) * 0.68
+    east += terrain._elliptic_gaussian(e_lobe1_y, 0.69, 0.13, 0.1, -0.32) * 0.72
+    east += terrain._elliptic_gaussian(e_lobe2_y, 0.82, 0.13, 0.1, 0.28) * 0.64
+
+    asym_noise = terrain._fbm(scale=84.0, octaves=3, persistence=0.54, lacunarity=2.05, offset=723.0) * 2.0 - 1.0
+    west = np.clip(west * (0.92 + asym_noise * 0.10), 0.0, 1.5)
+    east = np.clip(east * (0.92 - asym_noise * 0.07), 0.0, 1.5)
+
     width_scale = {"narrow": 0.78, "balanced": 1.0, "broad": 1.3}.get(rift_width, 1.0)
     strength = {"narrow": 0.96, "balanced": 1.1, "broad": 1.3}.get(rift_width, 1.1)
     rift = _natural_split_barrier(terrain, axis="vertical", width_scale=width_scale)
@@ -554,6 +668,22 @@ def _build_two_continents_rift_topology(terrain: TerrainGenerator, ruggedness: f
 def _build_central_inland_sea_intent_topology(terrain: TerrainGenerator, ruggedness: float, topology_intent: dict) -> np.ndarray:
     basin_shape = _intent_modifier(topology_intent, "basin_shape", "balanced")
     basin_style = _intent_modifier(topology_intent, "basin_style", "balanced")
+    h, w = terrain.height, terrain.width
+    base_seed = terrain._rng.integers(0, 2**31) if hasattr(terrain, '_rng') else 42
+
+    north_seed = (base_seed * 23 + 41) % (2**31)
+    south_seed = (base_seed * 31 + 59) % (2**31)
+    north_region = _generate_region_elevation(
+        w, h, north_seed,
+        (slice(0, int(h * 0.55)), slice(0, w)),
+        blend_width=10,
+    )
+    south_region = _generate_region_elevation(
+        w, h, south_seed,
+        (slice(int(h * 0.45), h), slice(0, w)),
+        blend_width=10,
+    )
+
     north = np.maximum.reduce(
         [
             terrain._elliptic_gaussian(0.24, 0.46, 0.17, 0.29, -0.12),
@@ -566,6 +696,9 @@ def _build_central_inland_sea_intent_topology(terrain: TerrainGenerator, ruggedn
             terrain._elliptic_gaussian(0.67, 0.31, 0.11, 0.15, -0.28) * 0.72,
         ]
     )
+    north = np.clip(north * 0.65 + north_region * 0.55, 0.0, 1.5)
+    south = np.clip(south * 0.65 + south_region * 0.55, 0.0, 1.5)
+
     west_shoulder = terrain._elliptic_gaussian(0.53, 0.25, 0.1, 0.13, -0.5) * 0.62
     east_shoulder = terrain._elliptic_gaussian(0.47, 0.76, 0.08, 0.12, 0.44) * 0.48
     basin = _natural_inland_sea_basin(terrain, basin_shape=basin_shape, basin_style=basin_style)
@@ -581,10 +714,41 @@ def _build_central_inland_sea_intent_topology(terrain: TerrainGenerator, ruggedn
 
 
 def _build_split_east_west_topology(terrain: TerrainGenerator, constraints: dict, ruggedness: float) -> np.ndarray:
-    west = _continent_component(terrain, "west", 0.46, [("northwest", 0.2, 0.58), ("southwest", 0.22, 0.66)])
-    east = _continent_component(terrain, "east", 0.46, [("northeast", 0.2, 0.62), ("southeast", 0.18, 0.54)])
+    h, w = terrain.height, terrain.width
+    base_seed = terrain._rng.integers(0, 2**31) if hasattr(terrain, '_rng') else 42
+    rng = terrain._rng if hasattr(terrain, '_rng') else np.random.RandomState(42)
+
+    west_seed = (base_seed * 13 + 29) % (2**31)
+    east_seed = (base_seed * 17 + 71) % (2**31)
+    west_region = _generate_region_elevation(
+        w, h, west_seed,
+        (slice(0, h), slice(0, int(w * 0.52))),
+        blend_width=10,
+    )
+    east_region = _generate_region_elevation(
+        w, h, east_seed,
+        (slice(0, h), slice(int(w * 0.48), w)),
+        blend_width=10,
+    )
+
+    w_size = 0.46 + (rng.random() - 0.5) * 0.06
+    e_size = 0.46 + (rng.random() - 0.5) * 0.06
+    w_nw_w = 0.58 + (rng.random() - 0.5) * 0.10
+    w_sw_w = 0.66 + (rng.random() - 0.5) * 0.10
+    e_ne_w = 0.62 + (rng.random() - 0.5) * 0.10
+    e_se_w = 0.54 + (rng.random() - 0.5) * 0.10
+
+    west = _continent_component(terrain, "west", w_size, [("northwest", 0.2, w_nw_w), ("southwest", 0.22, w_sw_w)])
+    east = _continent_component(terrain, "east", e_size, [("northeast", 0.2, e_ne_w), ("southeast", 0.18, e_se_w)])
     west *= _longitudinal_gate(terrain, "west")
     east *= _longitudinal_gate(terrain, "east")
+
+    west = np.clip(west * 0.7 + west_region * 0.5, 0.0, 1.5)
+    east = np.clip(east * 0.7 + east_region * 0.5, 0.0, 1.5)
+
+    asym_noise = terrain._fbm(scale=78.0, octaves=3, persistence=0.54, lacunarity=2.05, offset=717.0) * 2.0 - 1.0
+    west = np.clip(west * (0.92 + asym_noise * 0.12), 0.0, 1.5)
+    east = np.clip(east * (0.92 - asym_noise * 0.08), 0.0, 1.5)
 
     open_channel = np.maximum.reduce(
         [
@@ -603,21 +767,36 @@ def _build_split_east_west_topology(terrain: TerrainGenerator, constraints: dict
 
 
 def _build_inland_sea_topology(terrain: TerrainGenerator, constraints: dict, ruggedness: float) -> np.ndarray:
-    north_arc = _continent_component(terrain, "north", 0.34, [("northwest", 0.26, 0.88), ("northeast", 0.26, 0.88)])
-    south_arc = _continent_component(terrain, "south", 0.34, [("southwest", 0.26, 0.88), ("southeast", 0.26, 0.88)])
-    west_wall = _continent_component(terrain, "west", 0.18, [("northwest", 0.18, 0.55), ("southwest", 0.18, 0.55)])
-    east_wall = _continent_component(terrain, "east", 0.18, [("northeast", 0.18, 0.55), ("southeast", 0.18, 0.55)])
+    rng = terrain._rng if hasattr(terrain, '_rng') else np.random.RandomState(42)
+    n_size = 0.34 + (rng.random() - 0.5) * 0.06
+    s_size = 0.34 + (rng.random() - 0.5) * 0.06
+    nw_weight = 0.88 + (rng.random() - 0.5) * 0.12
+    ne_weight = 0.88 + (rng.random() - 0.5) * 0.12
+    sw_weight = 0.88 + (rng.random() - 0.5) * 0.12
+    se_weight = 0.88 + (rng.random() - 0.5) * 0.12
+    w_size = 0.18 + (rng.random() - 0.5) * 0.04
+    e_size = 0.18 + (rng.random() - 0.5) * 0.04
 
-    basin = np.maximum(
-        terrain._elliptic_gaussian(0.5, 0.5, 0.14, 0.24, 0.0),
-        terrain._create_location_mask("center", radius=0.16, sigma=0.38),
-    )
-    basin = np.maximum(basin, terrain._elliptic_gaussian(0.5, 0.5, 0.2, 0.3, 0.0) * 0.88)
-    west_outlet = terrain._elliptic_gaussian(0.5, 0.18, 0.05, 0.08, 0.0)
-    east_outlet = terrain._elliptic_gaussian(0.5, 0.82, 0.05, 0.08, 0.0)
-    north_cut = terrain._elliptic_gaussian(0.34, 0.5, 0.06, 0.18, 0.0)
-    south_cut = terrain._elliptic_gaussian(0.66, 0.5, 0.06, 0.18, 0.0)
+    north_arc = _continent_component(terrain, "north", n_size, [("northwest", 0.26, nw_weight), ("northeast", 0.26, ne_weight)])
+    south_arc = _continent_component(terrain, "south", s_size, [("southwest", 0.26, sw_weight), ("southeast", 0.26, se_weight)])
+    west_wall = _continent_component(terrain, "west", w_size, [("northwest", 0.18, 0.55), ("southwest", 0.18, 0.55)])
+    east_wall = _continent_component(terrain, "east", e_size, [("northeast", 0.18, 0.55), ("southeast", 0.18, 0.55)])
+
+    basin = _natural_inland_sea_basin(terrain)
+
+    west_outlet_y = 0.5 + (rng.random() - 0.5) * 0.04
+    east_outlet_y = 0.5 + (rng.random() - 0.5) * 0.04
+    west_outlet = terrain._elliptic_gaussian(west_outlet_y, 0.18, 0.05, 0.08, 0.0)
+    east_outlet = terrain._elliptic_gaussian(east_outlet_y, 0.82, 0.05, 0.08, 0.0)
+    north_cut_y = 0.34 + (rng.random() - 0.5) * 0.04
+    south_cut_y = 0.66 + (rng.random() - 0.5) * 0.04
+    north_cut = terrain._elliptic_gaussian(north_cut_y, 0.5, 0.06, 0.18, 0.0)
+    south_cut = terrain._elliptic_gaussian(south_cut_y, 0.5, 0.06, 0.18, 0.0)
+
+    asym_noise = terrain._fbm(scale=72.0, octaves=3, persistence=0.54, lacunarity=2.05, offset=711.0) * 2.0 - 1.0
     enclosure = np.maximum.reduce([north_arc, south_arc, west_wall, east_wall]) * 1.2
+    enclosure = np.clip(enclosure * (0.92 + asym_noise * 0.14), 0.0, 1.5)
+
     field = enclosure - basin * 1.34 - (west_outlet + east_outlet) * 0.22 - (north_cut + south_cut) * 0.24
     field = _apply_mountain_topology(terrain, field, constraints, ruggedness)
     return _normalize_topology(field)
@@ -1396,88 +1575,104 @@ def _intent_modifier(topology_intent: dict, key: str, default: str) -> str:
     return value or default
 
 
-def _natural_inland_sea_basin(terrain: TerrainGenerator, basin_shape: str = "balanced", basin_style: str = "balanced") -> np.ndarray:
-    if basin_shape == "compact":
-        basin = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.47, 0.45, 0.085, 0.11, -0.18),
-                terrain._elliptic_gaussian(0.54, 0.57, 0.075, 0.12, 0.16),
-                terrain._elliptic_gaussian(0.5, 0.51, 0.06, 0.16, 0.08) * 0.84,
-            ]
-        )
-        coves = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.43, 0.35, 0.035, 0.08, -0.64) * 0.46,
-                terrain._elliptic_gaussian(0.58, 0.65, 0.03, 0.07, 0.36) * 0.38,
-            ]
-        )
-    elif basin_shape == "broad":
-        basin = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.46, 0.4, 0.13, 0.16, -0.2),
-                terrain._elliptic_gaussian(0.55, 0.62, 0.12, 0.21, 0.24),
-                terrain._elliptic_gaussian(0.49, 0.53, 0.09, 0.28, 0.08) * 0.94,
-                terrain._elliptic_gaussian(0.52, 0.47, 0.07, 0.31, -0.06) * 0.7,
-            ]
-        )
-        coves = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.39, 0.31, 0.06, 0.14, -0.72) * 0.82,
-                terrain._elliptic_gaussian(0.62, 0.7, 0.05, 0.11, 0.42) * 0.64,
-                terrain._elliptic_gaussian(0.46, 0.76, 0.045, 0.1, 0.26) * 0.58,
-                terrain._elliptic_gaussian(0.58, 0.22, 0.055, 0.09, -0.36) * 0.5,
-            ]
-        )
-    elif basin_shape == "branched":
-        basin = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.47, 0.43, 0.1, 0.13, -0.22),
-                terrain._elliptic_gaussian(0.55, 0.6, 0.095, 0.16, 0.2),
-                terrain._elliptic_gaussian(0.5, 0.52, 0.07, 0.24, 0.1) * 0.9,
-                terrain._elliptic_gaussian(0.52, 0.48, 0.05, 0.28, -0.04) * 0.68,
-            ]
-        )
-        coves = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.36, 0.34, 0.05, 0.13, -0.82) * 0.88,
-                terrain._elliptic_gaussian(0.63, 0.69, 0.04, 0.11, 0.52) * 0.72,
-                terrain._elliptic_gaussian(0.45, 0.77, 0.038, 0.11, 0.28) * 0.68,
-                terrain._elliptic_gaussian(0.56, 0.23, 0.045, 0.1, -0.46) * 0.62,
-                terrain._elliptic_gaussian(0.52, 0.61, 0.03, 0.09, 0.14) * 0.58,
-            ]
-        )
+def _noise_driven_basin(
+    terrain: TerrainGenerator,
+    center_y: float,
+    center_x: float,
+    base_radius: float,
+    irregularity: float = 0.5,
+    aspect_bias: float = 0.0,
+    seed_offset: float = 0.0,
+) -> np.ndarray:
+    h, w = terrain.height, terrain.width
+    y = terrain._y_norm
+    x = terrain._x_norm
+
+    warp_x = terrain._fbm(scale=48.0, octaves=4, persistence=0.52, lacunarity=2.1, offset=1401.0 + seed_offset) * 2.0 - 1.0
+    warp_y = terrain._fbm(scale=52.0, octaves=4, persistence=0.52, lacunarity=2.1, offset=1409.0 + seed_offset) * 2.0 - 1.0
+    radius_noise = terrain._fbm(scale=36.0, octaves=5, persistence=0.54, lacunarity=2.15, offset=1417.0 + seed_offset) * 2.0 - 1.0
+
+    warp_strength = irregularity * 0.12
+    warped_x = x + warp_x * warp_strength
+    warped_y = y + warp_y * warp_strength
+
+    dx = warped_x - center_x
+    dy = warped_y - center_y
+
+    radius_mod = base_radius * (1.0 + radius_noise * irregularity * 0.45)
+    radius_mod = np.maximum(radius_mod, 0.01)
+
+    if abs(aspect_bias) > 0.01:
+        cos_a = np.cos(aspect_bias)
+        sin_a = np.sin(aspect_bias)
+        dx_rot = dx * cos_a - dy * sin_a
+        dy_rot = dx * sin_a + dy * cos_a
+        stretch = 1.0 + 0.3 * irregularity
+        distance = np.sqrt((dx_rot / radius_mod) ** 2 + (dy_rot / (radius_mod * stretch)) ** 2)
     else:
-        basin = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.46, 0.42, 0.11, 0.14, -0.24),
-                terrain._elliptic_gaussian(0.54, 0.6, 0.1, 0.18, 0.22),
-                terrain._elliptic_gaussian(0.49, 0.53, 0.075, 0.22, 0.11) * 0.9,
-                terrain._elliptic_gaussian(0.52, 0.47, 0.055, 0.26, -0.08) * 0.62,
-            ]
-        )
-        coves = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.39, 0.33, 0.055, 0.12, -0.72) * 0.8,
-                terrain._elliptic_gaussian(0.61, 0.68, 0.045, 0.09, 0.44) * 0.58,
-                terrain._elliptic_gaussian(0.47, 0.74, 0.04, 0.085, 0.3) * 0.54,
-                terrain._elliptic_gaussian(0.56, 0.24, 0.05, 0.075, -0.4) * 0.46,
-            ]
-        )
-    mask = np.maximum(basin, coves)
+        distance = np.sqrt((dx / radius_mod) ** 2 + (dy / radius_mod) ** 2)
+
+    field = np.exp(-(distance ** 2) / 2.0)
+    return np.clip(field, 0.0, 1.0).astype(np.float32)
+
+
+def _natural_inland_sea_basin(terrain: TerrainGenerator, basin_shape: str = "balanced", basin_style: str = "balanced") -> np.ndarray:
+    rng = terrain._rng if hasattr(terrain, '_rng') else np.random.RandomState(42)
+    jitter_y = lambda: (rng.random() - 0.5) * 0.06
+    jitter_x = lambda: (rng.random() - 0.5) * 0.08
+    jitter_angle = lambda: (rng.random() - 0.5) * 0.6
+
+    if basin_shape == "compact":
+        base_radius = 0.10
+        aspect = jitter_angle()
+        basin = _noise_driven_basin(terrain, 0.50 + jitter_y(), 0.50 + jitter_x(), base_radius, irregularity=0.55, aspect_bias=aspect, seed_offset=0.0)
+        lobe1 = _noise_driven_basin(terrain, 0.46 + jitter_y(), 0.44 + jitter_x(), 0.06, irregularity=0.6, aspect_bias=aspect + 0.8, seed_offset=11.0) * 0.72
+        lobe2 = _noise_driven_basin(terrain, 0.54 + jitter_y(), 0.58 + jitter_x(), 0.055, irregularity=0.6, aspect_bias=aspect - 0.6, seed_offset=23.0) * 0.64
+        cove1 = _noise_driven_basin(terrain, 0.42 + jitter_y(), 0.34 + jitter_x(), 0.04, irregularity=0.7, aspect_bias=-1.1, seed_offset=37.0) * 0.42
+        cove2 = _noise_driven_basin(terrain, 0.58 + jitter_y(), 0.66 + jitter_x(), 0.035, irregularity=0.7, aspect_bias=0.7, seed_offset=41.0) * 0.36
+        mask = np.maximum.reduce([basin, lobe1, lobe2, cove1, cove2])
+    elif basin_shape == "broad":
+        base_radius = 0.18
+        aspect = jitter_angle()
+        basin = _noise_driven_basin(terrain, 0.50 + jitter_y(), 0.50 + jitter_x(), base_radius, irregularity=0.55, aspect_bias=aspect, seed_offset=0.0)
+        lobe1 = _noise_driven_basin(terrain, 0.46 + jitter_y(), 0.38 + jitter_x(), 0.10, irregularity=0.6, aspect_bias=aspect + 0.5, seed_offset=13.0) * 0.82
+        lobe2 = _noise_driven_basin(terrain, 0.55 + jitter_y(), 0.64 + jitter_x(), 0.09, irregularity=0.6, aspect_bias=aspect - 0.4, seed_offset=19.0) * 0.74
+        arm1 = _noise_driven_basin(terrain, 0.38 + jitter_y(), 0.30 + jitter_x(), 0.06, irregularity=0.7, aspect_bias=-1.2, seed_offset=31.0) * 0.62
+        arm2 = _noise_driven_basin(terrain, 0.62 + jitter_y(), 0.72 + jitter_x(), 0.055, irregularity=0.7, aspect_bias=0.9, seed_offset=37.0) * 0.56
+        arm3 = _noise_driven_basin(terrain, 0.44 + jitter_y(), 0.76 + jitter_x(), 0.045, irregularity=0.7, aspect_bias=0.5, seed_offset=43.0) * 0.48
+        mask = np.maximum.reduce([basin, lobe1, lobe2, arm1, arm2, arm3])
+    elif basin_shape == "branched":
+        base_radius = 0.12
+        aspect = jitter_angle()
+        basin = _noise_driven_basin(terrain, 0.50 + jitter_y(), 0.50 + jitter_x(), base_radius, irregularity=0.55, aspect_bias=aspect, seed_offset=0.0)
+        branch1 = _noise_driven_basin(terrain, 0.36 + jitter_y(), 0.34 + jitter_x(), 0.07, irregularity=0.65, aspect_bias=-1.3, seed_offset=17.0) * 0.78
+        branch2 = _noise_driven_basin(terrain, 0.63 + jitter_y(), 0.69 + jitter_x(), 0.06, irregularity=0.65, aspect_bias=0.9, seed_offset=29.0) * 0.68
+        branch3 = _noise_driven_basin(terrain, 0.44 + jitter_y(), 0.77 + jitter_x(), 0.05, irregularity=0.7, aspect_bias=0.6, seed_offset=37.0) * 0.58
+        branch4 = _noise_driven_basin(terrain, 0.57 + jitter_y(), 0.23 + jitter_x(), 0.055, irregularity=0.7, aspect_bias=-0.8, seed_offset=43.0) * 0.52
+        branch5 = _noise_driven_basin(terrain, 0.52 + jitter_y(), 0.61 + jitter_x(), 0.04, irregularity=0.7, aspect_bias=0.3, seed_offset=53.0) * 0.48
+        mask = np.maximum.reduce([basin, branch1, branch2, branch3, branch4, branch5])
+    else:
+        base_radius = 0.14
+        aspect = jitter_angle()
+        basin = _noise_driven_basin(terrain, 0.50 + jitter_y(), 0.50 + jitter_x(), base_radius, irregularity=0.55, aspect_bias=aspect, seed_offset=0.0)
+        lobe1 = _noise_driven_basin(terrain, 0.46 + jitter_y(), 0.40 + jitter_x(), 0.08, irregularity=0.6, aspect_bias=aspect + 0.6, seed_offset=11.0) * 0.80
+        lobe2 = _noise_driven_basin(terrain, 0.55 + jitter_y(), 0.62 + jitter_x(), 0.075, irregularity=0.6, aspect_bias=aspect - 0.5, seed_offset=19.0) * 0.70
+        arm1 = _noise_driven_basin(terrain, 0.39 + jitter_y(), 0.32 + jitter_x(), 0.055, irregularity=0.7, aspect_bias=-1.2, seed_offset=31.0) * 0.58
+        arm2 = _noise_driven_basin(terrain, 0.61 + jitter_y(), 0.68 + jitter_x(), 0.05, irregularity=0.7, aspect_bias=0.8, seed_offset=37.0) * 0.50
+        arm3 = _noise_driven_basin(terrain, 0.47 + jitter_y(), 0.74 + jitter_x(), 0.04, irregularity=0.7, aspect_bias=0.6, seed_offset=43.0) * 0.44
+        mask = np.maximum.reduce([basin, lobe1, lobe2, arm1, arm2, arm3])
+
     if basin_style == "rift":
-        rift_core = np.maximum.reduce(
-            [
-                terrain._elliptic_gaussian(0.49, 0.47, 0.05, 0.22, -0.08),
-                terrain._elliptic_gaussian(0.53, 0.56, 0.045, 0.2, 0.12) * 0.86,
-                terrain._elliptic_gaussian(0.45, 0.37, 0.04, 0.16, -0.2) * 0.68,
-            ]
-        )
-        mask = np.maximum(mask * 0.9, rift_core)
+        rift1 = _noise_driven_basin(terrain, 0.49 + jitter_y(), 0.47 + jitter_x(), 0.06, irregularity=0.6, aspect_bias=-0.15, seed_offset=61.0) * 0.86
+        rift2 = _noise_driven_basin(terrain, 0.53 + jitter_y(), 0.56 + jitter_x(), 0.055, irregularity=0.6, aspect_bias=0.2, seed_offset=67.0) * 0.78
+        rift3 = _noise_driven_basin(terrain, 0.45 + jitter_y(), 0.37 + jitter_x(), 0.045, irregularity=0.65, aspect_bias=-0.35, seed_offset=71.0) * 0.62
+        mask = np.maximum(mask * 0.9, np.maximum.reduce([rift1, rift2, rift3]))
     elif basin_style == "mediterranean":
-        west_bay = terrain._elliptic_gaussian(0.5, 0.32, 0.065, 0.12, -0.12) * 0.76
-        east_bay = terrain._elliptic_gaussian(0.5, 0.69, 0.06, 0.14, 0.14) * 0.72
+        west_bay = _noise_driven_basin(terrain, 0.50 + jitter_y(), 0.30 + jitter_x(), 0.065, irregularity=0.6, aspect_bias=-0.2, seed_offset=79.0) * 0.72
+        east_bay = _noise_driven_basin(terrain, 0.50 + jitter_y(), 0.70 + jitter_x(), 0.06, irregularity=0.6, aspect_bias=0.25, seed_offset=83.0) * 0.68
         mask = np.maximum(mask, np.maximum(west_bay, east_bay))
-    return _naturalize_water_mask(terrain, mask, amplitude=0.2, smooth_passes=3, asymmetry=0.18, axis="vertical")
+
+    return _naturalize_water_mask(terrain, mask, amplitude=0.45, smooth_passes=1, asymmetry=0.25, axis="vertical")
 
 
 def _natural_strait_connector(terrain: TerrainGenerator, axis: str) -> np.ndarray:
@@ -1520,16 +1715,41 @@ def _naturalize_water_mask(
     asymmetry: float = 0.0,
     axis: str = "vertical",
 ) -> np.ndarray:
+    from scipy.ndimage import map_coordinates
+
+    h, w = mask.shape
+
+    warp_strength = amplitude * 0.14
+    warp_y = terrain._fbm(scale=62.0, octaves=4, persistence=0.52, lacunarity=2.1, offset=881.0) * 2.0 - 1.0
+    warp_x = terrain._fbm(scale=58.0, octaves=4, persistence=0.52, lacunarity=2.1, offset=997.0) * 2.0 - 1.0
+
+    y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
+    y_warped = y_coords + warp_y * warp_strength * h
+    x_warped = x_coords + warp_x * warp_strength * w
+
+    warped_mask = map_coordinates(mask, [y_warped, x_warped], order=1, mode="reflect")
+
     coast_noise = terrain._fbm(scale=46.0, octaves=4, persistence=0.55, lacunarity=2.15, offset=611.0) * 2.0 - 1.0
     macro_noise = terrain._fbm(scale=96.0, octaves=3, persistence=0.58, lacunarity=2.0, offset=677.0) * 2.0 - 1.0
-    edge_band = np.clip(mask * (1.0 - mask) * 4.2, 0.0, 1.0)
-    disturbed = mask + edge_band * (coast_noise * amplitude + macro_noise * (amplitude * 0.55))
+    fine_noise = terrain._fbm(scale=22.0, octaves=3, persistence=0.48, lacunarity=2.3, offset=653.0) * 2.0 - 1.0
+
+    edge_band = np.clip(warped_mask * (1.0 - warped_mask) * 4.6, 0.0, 1.0)
+
+    disturbed = warped_mask + edge_band * (
+        coast_noise * amplitude
+        + macro_noise * (amplitude * 0.55)
+        + fine_noise * (amplitude * 0.3)
+    )
+
     directional = _asymmetry_field(terrain, axis=axis)
     disturbed += edge_band * directional * asymmetry
-    embayments = np.clip(mask - 0.52, 0.0, 1.0) * np.clip(-coast_noise, 0.0, 1.0) * (amplitude * 0.22)
+
+    embayments = np.clip(warped_mask - 0.52, 0.0, 1.0) * np.clip(-coast_noise, 0.0, 1.0) * (amplitude * 0.22)
     disturbed = np.clip(disturbed + embayments * (1.0 + directional * 0.45), 0.0, 1.0)
+
     for _ in range(max(1, smooth_passes)):
         disturbed = gaussian_smooth(disturbed)
+
     return np.clip(disturbed, 0.0, 1.0).astype(np.float32)
 
 
@@ -1699,15 +1919,34 @@ def _render_preview_image(
     return Image.fromarray(image, mode="RGB")
 
 
-def _emit_debug_artifacts(arrays: dict[str, np.ndarray], topology_intent: dict) -> None:
+def _emit_debug_artifacts(arrays: dict[str, np.ndarray], topology_intent: dict, task_id: str) -> None:
     try:
+        from app.storage.artifact_repo import ArtifactRepository
+
+        repo = ArtifactRepository()
         elevation = arrays.get("elevation")
         if elevation is None:
             return
+
         land_mask = (elevation > 0.0).astype(np.uint8) * 255
         water_mask = (elevation <= 0.0).astype(np.uint8) * 255
         labels = component_labels(elevation > 0.0, min_cells=20)
         label_vis = (labels % 7 * 36).astype(np.uint8)
-        logger.info("Debug artifacts: land_mask/water_mask/labels shape=%s", elevation.shape)
+
+        repo.save_debug_image(task_id, "target_land_mask", Image.fromarray(land_mask, mode="L"))
+        repo.save_debug_image(task_id, "target_water_mask", Image.fromarray(water_mask, mode="L"))
+        repo.save_debug_image(task_id, "component_labels", Image.fromarray(label_vis, mode="L"))
+        repo.save_debug_image(task_id, "final_land_mask", Image.fromarray(land_mask, mode="L"))
+
+        repo.save_debug_array(task_id, "land_mask", (elevation > 0.0).astype(np.float32))
+        repo.save_debug_array(task_id, "water_mask", (elevation <= 0.0).astype(np.float32))
+        repo.save_debug_array(task_id, "component_labels_raw", labels.astype(np.int32))
+
+        metric_bytes = arrays.get("metric_report")
+        if metric_bytes is not None:
+            metric_data = json.loads(metric_bytes)
+            repo.save_debug_json(task_id, "metric_report", metric_data)
+
+        logger.info("Debug artifacts persisted for task=%s shape=%s", task_id, elevation.shape)
     except Exception as exc:
         logger.warning("Failed to emit debug artifacts: %s", exc)

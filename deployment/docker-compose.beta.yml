@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgis/postgis:15-3.4
     environment:
       POSTGRES_USER: mapuser
       POSTGRES_PASSWORD: mappass
@@ -9,6 +9,7 @@ services:
       - "5432:5432"
     volumes:
       - ../data/postgres:/var/lib/postgresql/data
+      - ./init-postgis.sql:/docker-entrypoint-initdb.d/init-postgis.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mapuser"]
       interval: 10s

@@ -60,7 +60,10 @@ def execute_generation(task_id: str) -> None:
         seed = _resolve_seed(task.task_id, task.params or {})
         plan_json = task.plan_json or {}
 
-    arrays, preview = render_world(plan_json, width=width, height=height, seed=seed)
+    arrays, preview = render_world(
+        plan_json, width=width, height=height, seed=seed,
+        emit_debug_artifacts=True, task_id=task_id,
+    )
     metric_report_raw = arrays.pop("metric_report", None)
     repo.save_world(task_id, **arrays)
 

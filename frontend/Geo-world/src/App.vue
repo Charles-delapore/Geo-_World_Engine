@@ -20,6 +20,16 @@ const canShowPreview = computed(() => Boolean(task.value?.previewUrl))
 const canShowInteractive = computed(() => Boolean(task.value?.manifestUrl))
 const shouldShowProcessing = computed(() => !task.value || task.value.status === 'processing')
 const showMapPlaceholder = computed(() => !canShowPreview.value && !showInteractive.value)
+const statusLabel = computed(() => {
+  if (!task.value) return '空闲'
+  const s = task.value.status
+  if (s === 'processing') return '生成中'
+  if (s === 'awaiting-confirm') return '待确认'
+  if (s === 'ready-image') return '预览就绪'
+  if (s === 'ready-interactive') return '交互就绪'
+  if (s === 'failed') return '失败'
+  return s
+})
 
 async function handleSubmit(payload: TaskFormPayload) {
   isSubmitting.value = true
@@ -67,65 +77,72 @@ function toggleInteractive() {
 
 <template>
   <div class="app-shell">
-    <section class="control-deck">
-      <div class="hero-copy">
-        <p class="eyebrow">Geo-WorldEngine Beta</p>
-        <h1>单一任务资源驱动的世界生成前台</h1>
-        <p class="hero-text">
-          默认展示静态预览图，交互瓦片只在产物就绪后由用户主动切换。上半区合并为单一控制台，当前任务的约束摘要和模拟参数会在下方持续刷新。
-        </p>
+    <header class="top-bar">
+      <div class="brand">
+        <span class="brand-icon">◆</span>
+        <div>
+          <h1 class="brand-title">Geo-WorldEngine</h1>
+          <p class="brand-sub">Beta · 程序化世界生成</p>
+        </div>
       </div>
-      <TaskForm class="control-form" :submitting="isSubmitting" @submit="handleSubmit" />
-    </section>
+      <div v-if="taskId" class="status-badge" :class="task?.status">
+        <span class="status-dot" />
+        {{ statusLabel }}
+      </div>
+    </header>
 
-    <section class="workspace-grid">
-      <aside class="status-panel">
+    <section class="main-layout">
+      <aside class="sidebar">
+        <TaskForm :submitting="isSubmitting" @submit="handleSubmit" />
+
         <StageIndicator
           :task="task"
           :is-polling="isPolling"
           :submit-error="submitError"
           @confirm="handleConfirm"
         />
-        <div class="status-actions">
+
+        <div class="sidebar-actions">
           <button
-            class="secondary-button"
+            class="btn-outline"
             type="button"
             :disabled="!taskId"
             @click="refresh"
           >
-            刷新状态
+            ↻ 刷新
           </button>
           <button
-            class="secondary-button"
+            class="btn-outline"
             type="button"
             :disabled="!canShowInteractive"
             @click="toggleInteractive"
           >
-            {{ showInteractive ? '返回静态预览' : '切换到交互地图' }}
+            {{ showInteractive ? '◁ 静态预览' : '▷ 交互地图' }}
           </button>
         </div>
       </aside>
 
-      <section class="artifact-panel">
-        <header class="artifact-header">
-          <div>
-            <p class="artifact-kicker">产物视图</p>
-            <h2>{{ showInteractive && canShowInteractive ? '交互瓦片地图' : '静态预览图' }}</h2>
-          </div>
-          <span v-if="taskId" class="task-chip">Task {{ taskId }}</span>
-        </header>
+      <section class="canvas-area">
+        <div class="canvas-header">
+          <h2>{{ showInteractive && canShowInteractive ? '交互瓦片地图' : canShowPreview ? '世界预览' : '世界画布' }}</h2>
+          <span v-if="taskId" class="task-tag">{{ taskId.slice(0, 8) }}</span>
+        </div>
 
-        <div class="artifact-body">
-          <div v-if="shouldShowProcessing" class="artifact-overlay">
-            <p class="overlay-title">{{ task?.currentStage ?? '等待新任务' }}</p>
-            <p class="overlay-copy">
-              {{ task ? '生成进行中，预览图会在首个产物完成后自动替换这里。' : '提交任务后，这里会直接显示地图区域中的生成进度。' }}
-            </p>
-            <ProgressBar :value="task?.progress ?? 0" />
+        <div class="canvas-body">
+          <div v-if="shouldShowProcessing" class="canvas-overlay">
+            <div class="overlay-content">
+              <div class="spinner" />
+              <p class="overlay-stage">{{ task?.currentStage ?? '等待新任务' }}</p>
+              <p class="overlay-hint">
+                {{ task ? '世界正在生成中…' : '输入描述后点击生成，世界将在此呈现。' }}
+              </p>
+              <ProgressBar v-if="task" :value="task.progress ?? 0" />
+            </div>
           </div>
 
-          <div v-if="showMapPlaceholder" class="map-placeholder">
-            <p>预览图尚未生成。</p>
+          <div v-if="showMapPlaceholder && !shouldShowProcessing" class="canvas-empty">
+            <div class="empty-icon">🗺</div>
+            <p>等待世界生成</p>
           </div>
 
           <MapPreview

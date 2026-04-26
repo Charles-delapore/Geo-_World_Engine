@@ -1,7 +1,28 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from scipy.ndimage import label, distance_transform_edt, sum as ndimage_sum
+
+logger = logging.getLogger(__name__)
+
+_HAS_SHAPELY = False
+try:
+    from shapely.geometry import shape, MultiPolygon, Point
+    from shapely.ops import unary_union
+    import geopandas as gpd
+    _HAS_SHAPELY = True
+except ImportError:
+    pass
+
+_HAS_SKIMAGE = False
+try:
+    from skimage.morphology import skeletonize as sk_skeletonize
+    from skimage.measure import regionprops as sk_regionprops, label as sk_label
+    _HAS_SKIMAGE = True
+except ImportError:
+    pass
 
 
 def count_components(mask: np.ndarray, min_cells: int = 1) -> int:
@@ -129,9 +150,100 @@ def component_labels(mask: np.ndarray, min_cells: int = 1) -> np.ndarray:
     return labels_arr
 
 
+def mask_to_geojson(mask: np.ndarray) -> list[dict]:
+    if not _HAS_SHAPELY:
+        return []
+    import json
+    from rasterio.features import shapes as rio_shapes
+
+    _HAS_RASTERIO = False
+    try:
+        from rasterio.features import shapes as _rio_shapes
+        _HAS_RASTERIO = True
+    except ImportError:
+        pass
+
+    if not _HAS_RASTERIO:
+        return []
+
+    results = []
+    for geom, value in _rio_shapes(mask.astype(np.uint8), mask=mask > 0):
+        if value > 0:
+            results.append(geom)
+    return results
+
+
+def shapely_skeleton_length(mask: np.ndarray) -> float:
+    if not _HAS_SKIMAGE:
+        return skeleton_length_numpy(mask)
+    binary = mask.astype(bool)
+    skel = sk_skeletonize(binary)
+    return float(np.sum(skel))
+
+
+def skeleton_length_numpy(mask: np.ndarray) -> float:
+    from scipy.ndimage import binary_erosion, generate_binary_structure
+    struct = generate_binary_structure(2, 2)
+    binary = mask.astype(bool)
+    skel = binary.copy()
+    prev = np.zeros_like(skel)
+    while np.any(skel) and not np.array_equal(skel, prev):
+        prev = skel.copy()
+        eroded = binary_erosion(skel, structure=struct)
+        skel = skel & ~eroded
+        skel = binary_erosion(skel, structure=generate_binary_structure(2, 1))
+        if not np.any(skel):
+            break
+    return float(np.sum(prev))
+
+
+def skeleton_length(mask: np.ndarray) -> float:
+    if _HAS_SKIMAGE:
+        return shapely_skeleton_length(mask)
+    return skeleton_length_numpy(mask)
+
+
+def shapely_convex_hull_area(mask: np.ndarray) -> float:
+    if not _HAS_SHAPELY:
+        return 0.0
+    ys, xs = np.where(mask)
+    if len(xs) < 3:
+        return 0.0
+    try:
+        from shapely.geometry import MultiPoint
+        points = MultiPoint(list(zip(xs.astype(float), ys.astype(float))))
+        hull = points.convex_hull
+        return float(hull.area)
+    except Exception:
+        return 0.0
+
+
+def shapely_component_properties(mask: np.ndarray, min_cells: int = 20) -> list[dict]:
+    if not _HAS_SKIMAGE:
+        return []
+    labeled = sk_label(mask > 0)
+    props = sk_regionprops(labeled)
+    results = []
+    for prop in props:
+        if prop.area < min_cells:
+            continue
+        results.append({
+            "area": int(prop.area),
+            "bbox": prop.bbox,
+            "centroid": prop.centroid,
+            "orientation": float(prop.orientation),
+            "axis_major_length": float(prop.axis_major_length if hasattr(prop, 'axis_major_length') else prop.major_axis_length),
+            "axis_minor_length": float(prop.axis_minor_length if hasattr(prop, 'axis_minor_length') else prop.minor_axis_length),
+            "eccentricity": float(prop.eccentricity),
+            "solidity": float(prop.solidity),
+        })
+    return results
+
+
 def compute_metric_report(
     elevation: np.ndarray,
     topology_intent: dict | None = None,
+    include_terrain_analysis: bool = True,
 ) -> dict:
     land_mask = elevation > 0.0
     water_mask = elevation <= 0.0
@@ -147,7 +259,46 @@ def compute_metric_report(
         "coast_roughness": coast_roughness(land_mask),
         "cross_cut_score": cross_cut_score(water_mask),
         "enclosure_score": enclosure_score(water_mask, land_mask),
+        "skeleton_length": skeleton_length(land_mask),
     }
+
+    if _HAS_SKIMAGE:
+        component_props = shapely_component_properties(land_mask, min_cells=20)
+        if component_props:
+            dominant = max(component_props, key=lambda p: p["area"])
+            report["dominant_component"] = dominant
+            report["component_details"] = component_props
+
+    if _HAS_SHAPELY:
+        hull_area = shapely_convex_hull_area(land_mask)
+        mask_area = float(np.sum(land_mask))
+        if hull_area > 0:
+            report["convex_hull_solidity"] = mask_area / hull_area
+
+    if include_terrain_analysis:
+        try:
+            from app.core.terrain_analysis import (
+                compute_geomorphons,
+                compute_ptrm,
+                compute_coastline_fractal_dimension,
+                compute_coastline_roughness_exponent,
+                compute_multi_scale_tpi,
+                compute_gradient_magnitude,
+            )
+            geom = compute_geomorphons(elevation, lookup_distance=3, flat_threshold=0.5)
+            report["ptrm_score"] = compute_ptrm(geom)
+            if np.any(land_mask):
+                report["coastline_fractal_dim"] = compute_coastline_fractal_dimension(land_mask)
+                report["coastline_roughness_exponent"] = compute_coastline_roughness_exponent(land_mask)
+            mstpi = compute_multi_scale_tpi(elevation, scales=[3, 9, 27])
+            report["tpi_variance_fine"] = float(np.var(mstpi["tpi_3"]))
+            report["tpi_variance_coarse"] = float(np.var(mstpi["tpi_27"]))
+            grad_mag = compute_gradient_magnitude(elevation)
+            report["mean_gradient"] = float(np.mean(grad_mag[land_mask])) if np.any(land_mask) else 0.0
+            report["max_gradient"] = float(np.max(grad_mag[land_mask])) if np.any(land_mask) else 0.0
+        except Exception as exc:
+            logger.warning("terrain_analysis metrics failed: %s", exc)
+
     if topology_intent:
         kind = str(topology_intent.get("kind", "")).lower()
         report["topology_intent_kind"] = kind

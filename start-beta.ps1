@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $backendDir = Join-Path $root 'backend'
-$frontendDir = Join-Path $root 'frontend\Geo-world'
+$frontendDir = Join-Path $root 'frontend\Geo-werci
 $pythonExe = Join-Path $root '.venv313\Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $pythonExe)) {
