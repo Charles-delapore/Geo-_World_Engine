@@ -7,6 +7,7 @@ const props = defineProps<{
   task: MapTask | null
   isPolling: boolean
   submitError: string | null
+  pollError: string | null
 }>()
 
 defineEmits<{
@@ -39,6 +40,14 @@ const metrics = computed(() => {
     { label: '分辨率', value: `${diagnostics.width}×${diagnostics.height}` },
   ]
 })
+
+const pollingText = computed(() => {
+  if (!props.isPolling) return ''
+  if (props.task?.status === 'ready-image' && props.task?.diagnostics?.generateTiles !== false) {
+    return '交互瓦片生成中…'
+  }
+  return '轮询中…'
+})
 </script>
 
 <template>
@@ -53,9 +62,10 @@ const metrics = computed(() => {
         <strong class="metric-value">{{ item.value }}</strong>
       </div>
     </div>
-    <p v-if="isPolling" class="stage-meta">轮询中…</p>
+    <p v-if="pollingText" class="stage-meta">{{ pollingText }}</p>
     <p v-if="task?.errorMsg" class="error-text">{{ task.errorMsg }}</p>
     <p v-if="submitError" class="error-text">{{ submitError }}</p>
+    <p v-if="pollError" class="error-text">{{ pollError }}</p>
     <button
       v-if="task?.status === 'awaiting-confirm'"
       class="primary-button"

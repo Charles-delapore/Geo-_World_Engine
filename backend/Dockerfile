@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV NUMBA_CACHE_DIR=/tmp/numba_cache
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
 
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 

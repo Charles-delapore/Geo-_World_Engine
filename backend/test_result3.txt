@@ -1,0 +1,11 @@
+.....................F....F...........F.........FFF.....                 [100%]
+=========================== short test summary info ===========================
+FAILED tests/test_golden_prompts.py::test_golden_prompt_topology[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002]
+FAILED tests/test_golden_prompts.py::test_golden_prompt_topology[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u72ed\u7a84\u7684\u6d77\u9694\u5f00\u3002]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e00\u5ea7\u56db\u9762\u73af\u6d77\u7684\u5c9b\u5c7f\u3002-seed_13]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_13]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_42]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_99]
+6 failed, 50 passed in 24.04s
+
+Return code: 1

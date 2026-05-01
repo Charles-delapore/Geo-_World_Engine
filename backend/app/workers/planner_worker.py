@@ -38,6 +38,38 @@ if settings.ENABLE_RAG:
         logger.warning("RAG init failed, running without retrieval: %s", exc)
 
 
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _position_item(item, key: str = "position", **defaults) -> dict:
+    if isinstance(item, dict):
+        result = dict(defaults)
+        result.update(item)
+        result[key] = str(result.get(key) or result.get("location") or "center")
+        return result
+    result = dict(defaults)
+    result[key] = str(item or "center")
+    return result
+
+
+def _mountain_item(item) -> dict:
+    if isinstance(item, dict):
+        location = str(item.get("location") or item.get("position") or "center")
+        return {"location": location, "height": float(item.get("height", 0.7)), "orientation": item.get("orientation")}
+    return {"location": str(item or "center"), "height": 0.7}
+
+
+def _relation_items(value) -> list[dict]:
+    return [item for item in _as_list(value) if isinstance(item, dict)]
+
+
 def build_world_plan(prompt: str, params: dict) -> WorldPlan:
     examples: list[dict] = []
     rag_meta = {"enabled": settings.ENABLE_RAG and _retriever is not None}
@@ -100,14 +132,14 @@ def build_world_plan(prompt: str, params: dict) -> WorldPlan:
         constraints=constraints,
         profile=profile,
         generation_backend=str(parsed.get("generation_backend") or "gaussian_voronoi"),
-        continents=[Continent(**item) for item in parsed.get("continents") or []],
-        mountains=[Mountain(**item) for item in parsed.get("mountains") or []],
-        island_chains=[IslandChain(**item) for item in parsed.get("island_chains") or []],
-        peninsulas=[Peninsula(**item) for item in parsed.get("peninsulas") or []],
-        inland_seas=[InlandSea(**item) for item in parsed.get("inland_seas") or []],
-        river_hints=[RiverHint(**item) for item in parsed.get("river_hints") or []],
-        water_bodies=[WaterBody(**item) for item in parsed.get("water_bodies") or []],
-        regional_relations=[RegionalRelation(**item) for item in parsed.get("regional_relations") or []],
+        continents=[Continent(**_position_item(item, size=0.3)) for item in _as_list(parsed.get("continents"))],
+        mountains=[Mountain(**_mountain_item(item)) for item in _as_list(parsed.get("mountains"))],
+        island_chains=[IslandChain(**_position_item(item, density=0.5)) for item in _as_list(parsed.get("island_chains"))],
+        peninsulas=[Peninsula(**_position_item(item, key="location", size=0.2)) for item in _as_list(parsed.get("peninsulas"))],
+        inland_seas=[InlandSea(**_position_item(item, connection=None)) for item in _as_list(parsed.get("inland_seas"))],
+        river_hints=[RiverHint(**_position_item(item, key="region", length="long")) for item in _as_list(parsed.get("river_hints"))],
+        water_bodies=[WaterBody(**_position_item(item, type="ocean", coverage=0.25, connection=None)) for item in _as_list(parsed.get("water_bodies"))],
+        regional_relations=[RegionalRelation(**item) for item in _relation_items(parsed.get("regional_relations"))],
         topology_intent=TopologyIntent(**parsed["topology_intent"]) if parsed.get("topology_intent") else None,
         module_sequence=[GenerationModuleSpec(**item) for item in parsed.get("module_sequence") or []],
         climate_hints=list(parsed.get("climate_hints") or []),

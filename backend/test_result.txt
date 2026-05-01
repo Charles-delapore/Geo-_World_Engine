@@ -1,0 +1,20 @@
+STDOUT:
+00\u5ea7\u5357\u5317\u5411\u72ed\u957f\u7684\u56db\u9762\u73af\u6d77\u5c9b\u5c7f\u3002-seed_7]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e00\u5ea7\u5357\u5317\u5411\u72ed\u957f\u7684\u56db\u9762\u73af\u6d77\u5c9b\u5c7f\u3002-seed_13]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e00\u5ea7\u5357\u5317\u5411\u72ed\u957f\u7684\u56db\u9762\u73af\u6d77\u5c9b\u5c7f\u3002-seed_42]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e00\u5ea7\u5357\u5317\u5411\u72ed\u957f\u7684\u56db\u9762\u73af\u6d77\u5c9b\u5c7f\u3002-seed_99]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_1]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_7]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_13]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_42]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_99]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e2d\u95f4\u662f\u4e00\u7247\u5bbd\u9614\u7684\u5185\u6d77\u3002-seed_1]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e2d\u95f4\u662f\u4e00\u7247\u5bbd\u9614\u7684\u5185\u6d77\u3002-seed_7]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e2d\u95f4\u662f\u4e00\u7247\u5bbd\u9614\u7684\u5185\u6d77\u3002-seed_13]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e2d\u95f4\u662f\u4e00\u7247\u5bbd\u9614\u7684\u5185\u6d77\u3002-seed_42]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e2d\u95f4\u662f\u4e00\u7247\u5bbd\u9614\u7684\u5185\u6d77\u3002-seed_99]
+39 failed, 17 passed in 6.50s
+
+STDERR (last 500):
+
+Return code: 1

@@ -10,6 +10,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _HAS_RASTERIO = False
+_RASTERIO_WARNED = False
 try:
     import rasterio
     from rasterio.transform import from_bounds
@@ -86,7 +87,10 @@ def elevation_to_cog(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not _HAS_RASTERIO:
-        logger.warning("rasterio not available, falling back to NPZ storage")
+        global _RASTERIO_WARNED
+        if not _RASTERIO_WARNED:
+            logger.warning("rasterio not available, falling back to NPZ storage")
+            _RASTERIO_WARNED = True
         np.savez_compressed(str(output_path).replace(".tif", ".npz"), elevation=elevation)
         return Path(str(output_path).replace(".tif", ".npz"))
 
@@ -110,9 +114,18 @@ def elevation_to_cog(
             blockxsize=256,
             blockysize=256,
             compress="deflate",
+            copy_src_overviews=True,
         ) as dst:
             dst.write(elevation, 1)
-            dst.overviews(1)
+            overview_levels = []
+            max_dim = max(h, w)
+            level = 2
+            while max_dim // level >= 256:
+                overview_levels.append(level)
+                level *= 2
+            if overview_levels:
+                dst.build_overviews(overview_levels, rasterio.enums.Resampling.average)
+                dst.update_tags(ns="rio_overview", **{str(l): "avg" for l in overview_levels})
         import shutil
         shutil.move(tmp_path, str(output_path))
     except Exception:

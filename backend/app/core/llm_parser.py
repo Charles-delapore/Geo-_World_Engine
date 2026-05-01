@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import re
@@ -8,6 +8,18 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from app.core.terrain import TerrainGenerator
+from app.core.semantic_mapper import (
+    map_size_continuous,
+    map_height_continuous,
+    map_ruggedness_continuous,
+    map_coast_complexity_continuous,
+    map_moisture_continuous,
+    map_temperature_bias_continuous,
+    map_land_ratio_continuous,
+    resolve_position_continuous,
+)
+from app.core.spatial_relation_graph import extract_srg, srg_to_topology_intent
+from app.core.spatial_critic import critique_with_iteration
 
 logger = logging.getLogger(__name__)
 
@@ -243,27 +255,27 @@ def infer_world_profile(prompt: str, constraints: MapConstraints) -> WorldProfil
 
     if has_single_island and not has_archipelago:
         profile.layout_template = "single_island"
-        profile.land_ratio = 0.38
-        profile.coast_complexity = 0.88
+        profile.land_ratio = map_land_ratio_continuous("single_island", lower)
+        profile.coast_complexity = map_coast_complexity_continuous(lower) if _contains_any(lower, ["曲折", "蜿蜒", "平直", "indented", "straight"]) else 0.88
         profile.island_factor = 0.18
         profile.sea_style = "open"
     elif landform_class == "supercontinent":
         profile.layout_template = "supercontinent"
-        profile.land_ratio = 0.62
+        profile.land_ratio = map_land_ratio_continuous("supercontinent", lower)
         profile.island_factor = 0.08
     elif len(constraints.continents) >= 3 or has_archipelago:
         profile.layout_template = "archipelago"
-        profile.land_ratio = 0.32
+        profile.land_ratio = map_land_ratio_continuous("archipelago", lower)
         profile.island_factor = 0.75
-        profile.coast_complexity = 0.82
+        profile.coast_complexity = map_coast_complexity_continuous(lower) if _contains_any(lower, ["曲折", "蜿蜒", "平直", "indented", "straight"]) else 0.82
     elif len(constraints.continents) == 2:
         positions = {item.position for item in constraints.continents}
         if {"west", "east"} <= positions:
             profile.layout_template = "split_east_west"
         elif {"north", "south"} <= positions:
             profile.layout_template = "split_north_south"
-        profile.land_ratio = 0.46
-        profile.coast_complexity = 0.62
+        profile.land_ratio = map_land_ratio_continuous("two_continents", lower)
+        profile.coast_complexity = map_coast_complexity_continuous(lower) if _contains_any(lower, ["曲折", "蜿蜒", "平直", "indented", "straight"]) else 0.62
 
     if has_inland_sea:
         profile.sea_style = "inland"
@@ -287,30 +299,44 @@ def infer_world_profile(prompt: str, constraints: MapConstraints) -> WorldProfil
         elif {"north", "south"} <= positions:
             profile.layout_template = "split_north_south"
 
+    terrain_texture = _detect_terrain_texture(lower)
+    if terrain_texture:
+        profile.ruggedness = terrain_texture.get("ruggedness", profile.ruggedness)
+
     if constraints.mountains or _contains_any(lower, ["mountainous", "rugged", "山脉", "高山", "峡谷", "崇山"]):
-        profile.ruggedness = 0.85
+        if not terrain_texture or terrain_texture.get("ruggedness", 0.55) < 0.7:
+            profile.ruggedness = map_ruggedness_continuous(lower)
     if _contains_any(lower, ["flat", "plain", "gentle", "平原", "平坦", "缓丘"]):
-        profile.ruggedness = 0.28
+        profile.ruggedness = map_ruggedness_continuous(lower)
+
+    if constraints.mountains:
+        for mtn in constraints.mountains:
+            if mtn.height >= 0.9:
+                profile.ruggedness = max(profile.ruggedness, 0.78)
 
     if _contains_any(lower, ["jagged", "fractured", "broken coast", "崎岖海岸", "破碎海岸"]):
-        profile.coast_complexity = 0.9
+        profile.coast_complexity = map_coast_complexity_continuous(lower)
     if _contains_any(lower, ["smooth coast", "round coast", "平滑海岸", "圆润海岸"]):
-        profile.coast_complexity = 0.24
+        profile.coast_complexity = map_coast_complexity_continuous(lower)
+
+    if _contains_any(lower, ["fjord", "firth", "峡湾", "峡湾海岸"]):
+        profile.coast_complexity = max(profile.coast_complexity, 0.88)
+        profile.ruggedness = max(profile.ruggedness, 0.75)
 
     if _contains_any(lower, ["desert", "arid", "dry", "沙漠", "干旱"]):
-        profile.moisture = 0.55
-        profile.temperature_bias = max(profile.temperature_bias, 4.0)
+        profile.moisture = map_moisture_continuous(lower)
+        profile.temperature_bias = map_temperature_bias_continuous(lower)
         profile.palette_hint = "arid"
     elif _contains_any(lower, ["lush", "wet", "rainforest", "swamp", "湿润", "雨林", "沼泽"]):
-        profile.moisture = 1.45
+        profile.moisture = map_moisture_continuous(lower)
         profile.palette_hint = "lush"
 
     if _contains_any(lower, ["frozen", "glacial", "icy", "tundra", "冰雪", "冻土", "寒冷"]):
-        profile.temperature_bias = -9.0
+        profile.temperature_bias = map_temperature_bias_continuous(lower)
         profile.palette_hint = "frozen"
     elif _contains_any(lower, ["tropical", "equatorial", "warm", "热带", "温暖", "赤道"]):
-        profile.temperature_bias = 6.0
-        profile.moisture = max(profile.moisture, 1.15)
+        profile.temperature_bias = map_temperature_bias_continuous(lower)
+        profile.moisture = max(profile.moisture, map_moisture_continuous(lower))
         profile.palette_hint = "tropical"
 
     if _contains_any(lower, ["easterly", "eastern winds", "东风"]):
@@ -325,6 +351,22 @@ def infer_world_profile(prompt: str, constraints: MapConstraints) -> WorldProfil
         profile.palette_hint = "volcanic"
         profile.temperature_bias = max(profile.temperature_bias, 3.0)
 
+    if _contains_any(lower, ["karst", "喀斯特", "溶岩", "石灰岩"]):
+        profile.ruggedness = max(profile.ruggedness, 0.68)
+        if not _contains_any(lower, ["lush", "wet", "湿润", "雨林"]):
+            profile.moisture = max(profile.moisture, 1.1)
+
+    if _contains_any(lower, ["sand dunes", "dune", "沙丘", " dunes"]):
+        profile.ruggedness = min(profile.ruggedness, 0.35)
+        profile.moisture = min(profile.moisture, 0.55)
+        profile.palette_hint = "dunes"
+        profile.coast_complexity = max(profile.coast_complexity, 0.1)
+
+    if _contains_any(lower, ["river delta", "delta", "三角洲", "河口"]):
+        profile.coast_complexity = max(profile.coast_complexity, 0.75)
+        profile.ruggedness = min(profile.ruggedness, 0.30)
+        profile.moisture = max(profile.moisture, 1.2)
+
     return profile
 
 
@@ -338,12 +380,20 @@ def parse_with_rag(
     constraints = parse_constraints(user_prompt, api_key=api_key, base_url=base_url, model=model)
     constraints = _enrich_constraints_from_sea_language(user_prompt, constraints)
     profile = infer_world_profile(user_prompt, constraints)
+    lower_for_texture = _normalize_prompt(user_prompt)
+    terrain_texture = _detect_terrain_texture(lower_for_texture)
     generation_backend = _select_generation_backend(user_prompt, profile)
+    if terrain_texture and terrain_texture.get("generation_backend"):
+        generation_backend = terrain_texture["generation_backend"]
+
+    srg = extract_srg(user_prompt)
+    srg_intent = srg_to_topology_intent(srg)
 
     plan = {
         "constraints": constraints.model_dump(mode="json"),
         "profile": profile.model_dump(mode="json"),
         "generation_backend": generation_backend,
+        "terrain_texture": terrain_texture,
         "continents": [{"position": item.position, "size": item.size} for item in constraints.continents],
         "mountains": [
             {"location": item.location, "height": item.height, "orientation": _infer_mountain_orientation(item.location)}
@@ -359,6 +409,9 @@ def parse_with_rag(
         "module_sequence": _build_module_sequence(user_prompt, constraints, profile, generation_backend),
         "climate_hints": _build_climate_hints(profile),
     }
+
+    plan = _merge_srg_into_plan(plan, srg_intent, srg)
+
     if examples:
         plan = _merge_rag_examples(user_prompt, plan, examples)
     plan["constraints"] = _sync_constraints_from_plan(plan, constraints).model_dump(mode="json")
@@ -372,6 +425,8 @@ def parse_with_rag(
         recheck = validate_world_plan(plan)
         if recheck:
             logger.warning("WorldPlan still has issues after auto-fix: %s", recheck)
+
+    plan = critique_with_iteration(user_prompt, plan, max_iterations=3)
 
     return plan
 
@@ -639,6 +694,56 @@ def _classify_landform_semantics(normalized_prompt: str, constraints: MapConstra
     if len(constraints.continents) == 1 and constraints.continents[0].position == "center":
         return "single_landmass"
     return "generic"
+
+
+TERRAIN_TEXTURE_PATTERNS: list[tuple[str, dict]] = [
+    ("steep_cliffs", {
+        "keywords": ["steep cliff", "cliff", "悬崖", "峭壁", "绝壁"],
+        "ruggedness": 0.88, "coast_complexity": 0.75,
+    }),
+    ("rolling_hills", {
+        "keywords": ["rolling hill", "gentle hill", "undulating", "丘陵", "起伏", "缓丘", "圆丘"],
+        "ruggedness": 0.42,
+    }),
+    ("canyons", {
+        "keywords": ["canyon", "gorge", "ravine", "峡谷", "沟壑", "裂谷", "深切", "深谷"],
+        "ruggedness": 0.82, "generation_backend": "modular",
+    }),
+    ("mesa_plateau", {
+        "keywords": ["mesa", "plateau", "tableland", "butte", "台地", "高原", "平顶山", "阶地"],
+        "ruggedness": 0.55, "generation_backend": "modular",
+    }),
+    ("jagged_peaks", {
+        "keywords": ["jagged peak", "spire", "horn", "尖峰", "锯齿", "角峰", "刀锋"],
+        "ruggedness": 0.95,
+    }),
+    ("badlands", {
+        "keywords": ["badland", "barren", "eroded", "荒地", "恶地", "荒芜", "沟壑纵横"],
+        "ruggedness": 0.68, "moisture": 0.45, "palette_hint": "arid",
+    }),
+    ("alpine", {
+        "keywords": ["alpine", "alps", "阿尔卑斯", "高山草甸", "雪峰", "终年积雪"],
+        "ruggedness": 0.88, "temperature_bias": -6.0, "palette_hint": "alpine",
+    }),
+    ("coastal_plains", {
+        "keywords": ["coastal plain", "seaside plain", "滨海平原", "沿海平原", "海岸低地"],
+        "ruggedness": 0.18, "coast_complexity": 0.30,
+    }),
+]
+
+
+def _detect_terrain_texture(normalized_prompt: str) -> dict | None:
+    best: dict | None = None
+    best_priority = 0
+    for name, config in TERRAIN_TEXTURE_PATTERNS:
+        for kw in config["keywords"]:
+            if kw in normalized_prompt:
+                priority = len(kw)
+                if priority > best_priority:
+                    best_priority = priority
+                    best = dict(config)
+                    best["texture_name"] = name
+    return best
 
 
 def _extract_positions(prompt: str) -> List[str]:
@@ -999,24 +1104,12 @@ def _extract_feature_position_pairs(normalized: str, terms_pattern: str) -> List
 
 
 def _extract_size(lower: str, position: str) -> float:
-    local_window = _extract_position_window(lower, position)
-    if _contains_any(local_window, ["huge", "giant", "massive", "large", "辽阔", "巨大"]):
-        return 0.62
-    if _contains_any(local_window, ["small", "tiny", "narrow", "slim", "狭长", "小型", "较小"]):
-        return 0.28
-    if position in {"west", "east", "north", "south"}:
-        return 0.44
-    return 0.52
+    local_window = _extract_position_window(lower, position, radius=48)
+    return map_size_continuous(local_window, position)
 
 
 def _extract_mountain_height(lower: str) -> float:
-    if _contains_any(lower, ["towering", "very high", "lofty", "极高", "高耸"]):
-        return 1.0
-    if _contains_any(lower, ["high", "tall", "rugged", "高", "山脉", "高山"]):
-        return 0.9
-    if _contains_any(lower, ["low", "gentle", "small", "低矮", "丘陵"]):
-        return 0.55
-    return 0.78
+    return map_height_continuous(lower)
 
 
 def _normalize_prompt(prompt: str) -> str:
@@ -1119,3 +1212,76 @@ def _infer_separator_zone(continents: List[ContinentConstraint]) -> str:
     if "east" in positions:
         return "west"
     return "center"
+
+
+def _merge_srg_into_plan(plan: dict, srg_intent: dict, srg) -> dict:
+    srg_continents = srg_intent.get("continents") or []
+    srg_mountains = srg_intent.get("mountains") or []
+    srg_sea_zones = srg_intent.get("sea_zones") or []
+    srg_inland_seas = srg_intent.get("inland_seas") or []
+    srg_island_chains = srg_intent.get("island_chains") or []
+    srg_peninsulas = srg_intent.get("peninsulas") or []
+    srg_predicates = srg_intent.get("topology_predicates") or []
+    srg_disconnect = srg_intent.get("must_disconnect_pairs") or []
+    srg_kind = srg_intent.get("kind")
+
+    existing_continents = plan.get("continents") or []
+    if len(srg_continents) > len(existing_continents):
+        plan["continents"] = srg_continents
+
+    existing_mountains = plan.get("mountains") or []
+    if srg_mountains and not existing_mountains:
+        plan["mountains"] = srg_mountains
+    elif srg_mountains and existing_mountains:
+        merged_positions = {m.get("location") for m in existing_mountains}
+        for mtn in srg_mountains:
+            if mtn.get("location") not in merged_positions:
+                existing_mountains.append(mtn)
+        plan["mountains"] = existing_mountains
+
+    existing_sea_zones = set(plan.get("constraints", {}).get("sea_zones") or [])
+    for zone in srg_sea_zones:
+        existing_sea_zones.add(zone)
+    if existing_sea_zones:
+        constraints = dict(plan.get("constraints") or {})
+        constraints["sea_zones"] = list(existing_sea_zones)
+        plan["constraints"] = constraints
+
+    existing_inland = plan.get("inland_seas") or []
+    if srg_inland_seas and not existing_inland:
+        plan["inland_seas"] = srg_inland_seas
+
+    existing_chains = plan.get("island_chains") or []
+    if srg_island_chains and not existing_chains:
+        plan["island_chains"] = srg_island_chains
+
+    existing_peninsulas = plan.get("peninsulas") or []
+    if srg_peninsulas and not existing_peninsulas:
+        plan["peninsulas"] = srg_peninsulas
+
+    if srg_predicates:
+        plan["topology_predicates"] = srg_predicates
+
+    if srg_disconnect:
+        existing_disconnect = plan.get("topology_intent", {}).get("must_disconnect_pairs") or []
+        for pair in srg_disconnect:
+            if pair not in existing_disconnect:
+                existing_disconnect.append(pair)
+        if existing_disconnect and plan.get("topology_intent"):
+            plan["topology_intent"]["must_disconnect_pairs"] = existing_disconnect
+
+    if srg_kind:
+        existing_intent = plan.get("topology_intent")
+        if not existing_intent or existing_intent.get("kind") is None:
+            plan["topology_intent"] = plan.get("topology_intent") or {}
+            plan["topology_intent"]["kind"] = srg_kind
+            if srg_intent.get("forbid_cross_cut"):
+                plan["topology_intent"]["forbid_cross_cut"] = True
+            if srg_intent.get("exact_landmass_count"):
+                plan["topology_intent"]["exact_landmass_count"] = srg_intent["exact_landmass_count"]
+            if srg_intent.get("min_land_component_count"):
+                plan["topology_intent"]["min_land_component_count"] = srg_intent["min_land_component_count"]
+
+    plan["srg"] = srg.to_dict()
+
+    return plan

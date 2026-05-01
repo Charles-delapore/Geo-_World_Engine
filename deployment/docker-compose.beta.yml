@@ -80,6 +80,8 @@ services:
         condition: service_healthy
     environment:
       RUN_DB_MIGRATIONS: "false"
+      NUMBA_THREADING_LAYER: "tbb"
+      NUMBA_CACHE_DIR: "/tmp/numba_cache"
     command: python celery_worker.py
 
   celery-tile:
@@ -96,6 +98,8 @@ services:
         condition: service_healthy
     environment:
       RUN_DB_MIGRATIONS: "false"
+      NUMBA_THREADING_LAYER: "tbb"
+      NUMBA_CACHE_DIR: "/tmp/numba_cache"
     command: python tile_worker.py
 
   frontend:

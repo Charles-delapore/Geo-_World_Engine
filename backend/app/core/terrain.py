@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
@@ -105,10 +105,12 @@ class TerrainGenerator:
             result = result * (0.76 + coast * 0.18) + land_support * 0.3 + continental_core * 0.16 - open_ocean * 0.24
 
             if len(land_masks) >= 2:
+                sea_style = constraints.get("sea_style", "open")
+                width_hint = 0.055 if sea_style == "strait" else (0.12 if sea_style == "open" else 0.085)
                 separators = np.zeros_like(result)
                 for left in range(len(land_masks)):
                     for right in range(left + 1, len(land_masks)):
-                        corridor = self._sea_corridor_mask(land_masks[left], land_masks[right])
+                        corridor = self._sea_corridor_mask(land_masks[left], land_masks[right], width_hint)
                         separators = np.maximum(separators, corridor)
                 result -= gaussian_filter(separators, sigma=5.4) * 0.24
         else:
@@ -123,7 +125,7 @@ class TerrainGenerator:
         for mountain in constraints.get("mountains", []):
             location = mountain.get("location", "center")
             height = float(mountain.get("height", 0.8))
-            chain = self._create_mountain_chain_mask(location)
+            chain = self._create_mountain_chain_mask(location, height)
             ridge = self._ridged_noise(scale=38.0, octaves=3, offset=height * 17.0 + len(location))
             ridge = ridge * 2.0 - 1.0
             land_anchor = np.clip(gaussian_filter(np.maximum(combined_land, np.clip(result, 0.0, 1.0)), sigma=2.2), 0.0, 1.0)
@@ -392,23 +394,24 @@ class TerrainGenerator:
             sigma=max(5.2, min(self.width, self.height) * 0.024),
         )
 
-    def _create_mountain_chain_mask(self, location: str) -> np.ndarray:
+    def _create_mountain_chain_mask(self, location: str, height: float = 0.78) -> np.ndarray:
         center_y, center_x = self._resolve_position(location)
         orientation = self._position_rotation(location)
-        primary = self._elliptic_gaussian(center_y, center_x, 0.26, 0.08, orientation)
-        secondary = self._elliptic_gaussian(center_y, center_x, 0.32, 0.06, orientation + 0.45) * 0.55
+        h_scale = 0.6 + 0.6 * min(height, 1.5)
+        primary = self._elliptic_gaussian(center_y, center_x, 0.26 * h_scale, 0.08 * h_scale, orientation)
+        secondary = self._elliptic_gaussian(center_y, center_x, 0.32 * h_scale, 0.06 * h_scale, orientation + 0.45) * 0.55
         tail = self._elliptic_gaussian(
-            np.clip(center_y + np.sin(orientation) * 0.12, 0.08, 0.92),
-            np.clip(center_x + np.cos(orientation) * 0.12, 0.08, 0.92),
-            0.21,
-            0.055,
+            np.clip(center_y + np.sin(orientation) * 0.12 * h_scale, 0.08, 0.92),
+            np.clip(center_x + np.cos(orientation) * 0.12 * h_scale, 0.08, 0.92),
+            0.21 * h_scale,
+            0.055 * h_scale,
             orientation - 0.18,
         ) * 0.62
         warped = self._fbm(scale=56.0, octaves=3, persistence=0.54, lacunarity=2.0, offset=len(location) * 7.0)
         chain = np.clip(np.maximum.reduce([primary, secondary, tail]) * (0.78 + warped * 0.42), 0.0, 1.0)
         return gaussian_filter(chain.astype(np.float32), sigma=max(1.4, min(self.width, self.height) * 0.008))
 
-    def _sea_corridor_mask(self, left_mask: np.ndarray, right_mask: np.ndarray) -> np.ndarray:
+    def _sea_corridor_mask(self, left_mask: np.ndarray, right_mask: np.ndarray, width_hint: float = 0.085) -> np.ndarray:
         left_y, left_x = self._mask_centroid(left_mask)
         right_y, right_x = self._mask_centroid(right_mask)
         dx = right_x - left_x
@@ -422,7 +425,7 @@ class TerrainGenerator:
         closest_x = left_x + projection * dx
         closest_y = left_y + projection * dy
         distance = np.sqrt(self._wrapped_dx(self._x_norm - closest_x) ** 2 + (self._y_norm - closest_y) ** 2)
-        corridor = np.exp(-(distance**2) / (2.0 * 0.085 * 0.085))
+        corridor = np.exp(-(distance**2) / (2.0 * width_hint * width_hint))
         ocean_window = np.clip(1.0 - np.maximum(left_mask, right_mask), 0.0, 1.0)
         return gaussian_filter((corridor * ocean_window).astype(np.float32), sigma=2.0)
 
@@ -491,31 +494,20 @@ class TerrainGenerator:
         if band * 2 >= self.width:
             return elev.astype(np.float32)
 
-        wrapped = elev.astype(np.float32).copy()
-        inner_mean = wrapped[:, band:-band].mean(axis=1)
-        central_bias = float(np.mean(wrapped[:, self.width // 4 : (self.width * 3) // 4]))
-        for offset in range(band):
-            blend = min(0.92, offset / max(band - 1, 1))
-            left_index = offset
-            right_index = -(offset + 1)
-            seam_average = (wrapped[:, left_index] + wrapped[:, right_index]) * 0.5
-            wrapped[:, left_index] = wrapped[:, left_index] * blend + seam_average * (1.0 - blend)
-            wrapped[:, right_index] = wrapped[:, right_index] * blend + seam_average * (1.0 - blend)
-            interior_blend = 1.0 * (1.0 - min(1.0, offset / max(band, 1)))
-            left_interior = min(self.width - 1, band + offset)
-            right_interior = max(0, self.width - band - offset - 1)
-            interior_target = inner_mean * 0.1 + central_bias * 0.9
-            wrapped[:, left_index] = (
-                wrapped[:, left_index] * (1.0 - interior_blend) + interior_target * interior_blend
-            )
-            wrapped[:, right_index] = (
-                wrapped[:, right_index] * (1.0 - interior_blend) + interior_target * interior_blend
-            )
-        side_lift_band = min(10, band)
-        if side_lift_band > 0:
-            wrapped[:, :side_lift_band] = wrapped[:, :side_lift_band] * 0.28 + central_bias * 0.72
-            wrapped[:, -side_lift_band:] = wrapped[:, -side_lift_band:] * 0.28 + central_bias * 0.72
-        return gaussian_filter(wrapped, sigma=(0.0, 0.7)).astype(np.float32)
+        wrapped = elev.astype(np.float32)
+        padded = np.concatenate([wrapped[:, -band:], wrapped, wrapped[:, :band]], axis=1)
+        periodic = gaussian_filter(padded, sigma=(0.0, 0.85)).astype(np.float32)[:, band:-band]
+
+        weights = np.zeros_like(wrapped, dtype=np.float32)
+        ramp = np.linspace(1.0, 0.0, band, dtype=np.float32)
+        weights[:, :band] = ramp
+        weights[:, -band:] = ramp[::-1]
+
+        result = wrapped * (1.0 - weights * 0.42) + periodic * (weights * 0.42)
+        seam = (result[:, 0] + result[:, -1]) * 0.5
+        result[:, 0] = seam
+        result[:, -1] = seam
+        return result.astype(np.float32)
 
     def _position_rotation(self, position: str) -> float:
         normalized = (position or "center").lower().replace("-", "")
@@ -534,20 +526,8 @@ class TerrainGenerator:
         return mapping.get(normalized, 0.2)
 
     def _resolve_position(self, position: str) -> Tuple[float, float]:
-        normalized = (position or "center").lower().replace("-", "")
-        mapping = {
-            "northwest": (0.22, 0.22),
-            "north": (0.2, 0.5),
-            "northeast": (0.22, 0.78),
-            "west": (0.5, 0.22),
-            "center": (0.5, 0.5),
-            "east": (0.5, 0.78),
-            "southwest": (0.78, 0.22),
-            "south": (0.8, 0.5),
-            "southeast": (0.78, 0.78),
-            "central": (0.5, 0.5),
-        }
-        return mapping.get(normalized, (0.5, 0.5))
+        from app.core.semantic_mapper import resolve_position_continuous
+        return resolve_position_continuous(position)
 
     @staticmethod
     def _normalize(values: np.ndarray) -> np.ndarray:

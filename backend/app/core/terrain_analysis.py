@@ -50,6 +50,8 @@ def compute_geomorphons(
     dem: np.ndarray,
     lookup_distance: int = 3,
     flat_threshold: float = 1.0,
+    use_zenith_angle: bool = True,
+    cell_size: float = 1.0,
 ) -> np.ndarray:
     h, w = dem.shape
     dem_f = dem.astype(np.float64)
@@ -66,15 +68,58 @@ def compute_geomorphons(
         (-lookup_distance, -lookup_distance),
     ]
 
-    for i, (dy, dx) in enumerate(offsets):
-        shifted = np.roll(np.roll(dem_f, -dy, axis=0), -dx, axis=1)
-        diff = dem_f - shifted
-        angles[:, :, i] = np.where(
-            diff > flat_threshold, 1,
-            np.where(diff < -flat_threshold, -1, 0)
-        ).astype(np.int16)
+    if use_zenith_angle:
+        for i, (dy, dx) in enumerate(offsets):
+            dist = np.sqrt(dy * dy + dx * dx) * cell_size
 
-    pad = lookup_distance
+            shifted_y_start = max(0, dy)
+            shifted_y_end = min(h, h + dy)
+            shifted_x_start = max(0, dx)
+            shifted_x_end = min(w, w + dx)
+
+            src_y_start = max(0, -dy)
+            src_y_end = src_y_start + (shifted_y_end - shifted_y_start)
+            src_x_start = max(0, -dx)
+            src_x_end = src_x_start + (shifted_x_end - shifted_x_start)
+
+            if shifted_y_end <= shifted_y_start or shifted_x_end <= shifted_x_start:
+                continue
+
+            diff = dem_f[src_y_start:src_y_end, src_x_start:src_x_end] - dem_f[shifted_y_start:shifted_y_end, shifted_x_start:shifted_x_end]
+
+            zenith = np.arctan2(diff, dist)
+            nadir = np.arctan2(-diff, dist)
+
+            angle_threshold = np.radians(flat_threshold)
+
+            patch = np.where(
+                zenith > angle_threshold, 1,
+                np.where(nadir > angle_threshold, -1, 0)
+            ).astype(np.int16)
+
+            angles[src_y_start:src_y_end, src_x_start:src_x_end, i] = patch
+
+        pad = lookup_distance
+        for i in range(8):
+            angles[:pad, :, i] = 0
+            angles[-pad:, :, i] = 0
+            angles[:, :pad, i] = 0
+            angles[:, -pad:, i] = 0
+    else:
+        for i, (dy, dx) in enumerate(offsets):
+            shifted = np.roll(np.roll(dem_f, -dy, axis=0), -dx, axis=1)
+            diff = dem_f - shifted
+            angles[:, :, i] = np.where(
+                diff > flat_threshold, 1,
+                np.where(diff < -flat_threshold, -1, 0)
+            ).astype(np.int16)
+
+        pad = lookup_distance
+        angles[:pad, :, :] = 0
+        angles[-pad:, :, :] = 0
+        angles[:, :pad, :] = 0
+        angles[:, -pad:, :] = 0
+
     codes = np.zeros((h, w), dtype=np.int64)
     for i in range(8):
         codes += (angles[:, :, i] + 1) * (3 ** i)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -14,9 +15,11 @@ from app.orchestrator.orchestrator import _resolve_seed, queue_generation, queue
 from app.orchestrator.state_machine import PUBLIC_STATUS
 from app.storage.artifact_repo import ArtifactRepository
 from app.storage.models import TaskRecord, TaskStatus, get_db, session_scope
+from app.utils.helpers import safe_dict
 
 router = APIRouter(prefix="/maps", tags=["maps"])
 repo = ArtifactRepository()
+logger = logging.getLogger(__name__)
 
 
 class CreateMapRequest(BaseModel):
@@ -28,9 +31,11 @@ class CreateMapRequest(BaseModel):
     module_sequence: list[GenerationModuleSpec] = Field(default_factory=list)
     auto_confirm: bool = settings.DEFAULT_AUTO_CONFIRM
     generate_tiles: bool = settings.DEFAULT_GENERATE_TILES
+    projection: Literal["flat", "planet"] = "planet"
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     llm_model: str | None = None
+    asset_ids: list[str] = Field(default_factory=list)
 
 
 class MapResource(BaseModel):
@@ -47,27 +52,38 @@ class MapResource(BaseModel):
     updatedAt: datetime
 
 
-def _artifact_url(request: Request, path: str) -> str:
-    return f"{settings.API_V1_STR}{path}"
+def _artifact_url(request: Request, path: str, version: str | None = None) -> str:
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "http")
+    if forwarded_host:
+        base = f"{forwarded_proto}://{forwarded_host}"
+    else:
+        base = str(request.base_url).rstrip("/")
+    url = f"{base}{settings.API_V1_STR}{path}"
+    return f"{url}?v={version}" if version else url
 
 
 def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
-    preview_url = _artifact_url(request, f"/maps/{task.task_id}/preview.png") if task.preview_ready else None
+    artifact_version = str(int(task.updated_at.timestamp() * 1000)) if task.updated_at else None
+    preview_url = _artifact_url(request, f"/maps/{task.task_id}/preview.png", artifact_version) if task.preview_ready else None
     manifest_url = (
-        _artifact_url(request, f"/maps/{task.task_id}/tiles/manifest.json") if task.tiles_ready else None
+        _artifact_url(request, f"/maps/{task.task_id}/tiles/manifest.json", artifact_version) if task.tiles_ready else None
     )
-    plan = task.plan_json or {}
-    profile = plan.get("profile") or {}
-    constraints = plan.get("constraints") or {}
-    rag_meta = plan.get("rag_meta") or {}
-    params = task.params or {}
+    plan = safe_dict(task.plan_json)
+    profile = safe_dict(plan.get("profile"))
+    constraints = safe_dict(plan.get("constraints"))
+    rag_meta = safe_dict(plan.get("rag_meta"))
+    params = safe_dict(task.params)
+    topology_intent = safe_dict(plan.get("topology_intent"))
     diagnostics = {
         "seed": _resolve_seed(task.task_id, params),
         "width": int(params.get("width", settings.DEFAULT_WIDTH)),
         "height": int(params.get("height", settings.DEFAULT_HEIGHT)),
         "generationBackend": plan.get("generation_backend", "gaussian_voronoi"),
-        "topologyIntent": (plan.get("topology_intent") or {}).get("kind"),
-        "topologyModifiers": (plan.get("topology_intent") or {}).get("modifiers") or {},
+        "projection": params.get("projection", "planet"),
+        "generateTiles": bool(params.get("generate_tiles", settings.DEFAULT_GENERATE_TILES)),
+        "topologyIntent": topology_intent.get("kind"),
+        "topologyModifiers": topology_intent.get("modifiers") or {},
         "layoutTemplate": profile.get("layout_template", "default"),
         "seaStyle": profile.get("sea_style", "open"),
         "landRatio": float(profile.get("land_ratio", 0.44)),
@@ -109,8 +125,43 @@ def _serialize_task(task: TaskRecord, request: Request) -> MapResource:
     )
 
 
+def _sync_artifact_state(task: TaskRecord, db: Session) -> None:
+    if task.status == TaskStatus.FAILED.value:
+        return
+    preview_ready = repo.has_preview(task.task_id)
+    tiles_ready = repo.has_manifest(task.task_id)
+    if task.status == TaskStatus.READY.value and not task.tiles_ready:
+        tiles_ready = False
+    changed = False
+    if task.preview_ready != preview_ready:
+        task.preview_ready = preview_ready
+        changed = True
+    if task.tiles_ready != tiles_ready:
+        task.tiles_ready = tiles_ready
+        changed = True
+    if tiles_ready and task.status != TaskStatus.READY_INTERACTIVE.value:
+        task.status = TaskStatus.READY_INTERACTIVE.value
+        task.current_stage = "交互地图已就绪"
+        task.progress = 100
+        changed = True
+    elif preview_ready and task.status in {
+        TaskStatus.QUEUED.value,
+        TaskStatus.PARSING.value,
+        TaskStatus.GENERATING_TERRAIN.value,
+        TaskStatus.RENDERING_IMAGE.value,
+    }:
+        task.status = TaskStatus.READY.value
+        task.current_stage = "预览图已就绪"
+        task.progress = max(task.progress, 100)
+        changed = True
+    if changed:
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+
 @router.post("", response_model=MapResource, status_code=201)
-def create_map(payload: CreateMapRequest, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def create_map(payload: CreateMapRequest, request: Request, db: Session = Depends(get_db)):
     task_id = str(uuid4())
     record = TaskRecord(
         task_id=task_id,
@@ -123,12 +174,10 @@ def create_map(payload: CreateMapRequest, request: Request, background_tasks: Ba
     db.add(record)
     db.commit()
     db.refresh(record)
+    logger.info("Task created: task_id=%s projection=%s", task_id, payload.projection)
 
     if settings.ENABLE_BACKGROUND_PIPELINE:
-        if settings.RUN_MODE.lower() == "celery":
-            queue_orchestrator(task_id)
-        else:
-            background_tasks.add_task(queue_orchestrator, task_id)
+        queue_orchestrator(task_id)
     return _serialize_task(record, request)
 
 
@@ -136,12 +185,16 @@ def create_map(payload: CreateMapRequest, request: Request, background_tasks: Ba
 def get_map(task_id: str, request: Request, db: Session = Depends(get_db)):
     task = db.get(TaskRecord, task_id)
     if task is None:
+        logger.warning("Task not found: task_id=%s host=%s xfwd=%s", task_id,
+                       request.headers.get("host", "-"),
+                       request.headers.get("x-forwarded-host", "-"))
         raise HTTPException(status_code=404, detail="Task not found")
+    _sync_artifact_state(task, db)
     return _serialize_task(task, request)
 
 
 @router.post("/{task_id}/confirm", status_code=204)
-def confirm_map(task_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def confirm_map(task_id: str, db: Session = Depends(get_db)):
     task = db.get(TaskRecord, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -151,8 +204,5 @@ def confirm_map(task_id: str, background_tasks: BackgroundTasks, db: Session = D
     task.progress = max(task.progress, 20)
     db.add(task)
     db.commit()
-    if settings.RUN_MODE.lower() == "celery":
-        queue_generation(task_id)
-    else:
-        background_tasks.add_task(queue_generation, task_id)
+    queue_generation(task_id)
     return Response(status_code=204)

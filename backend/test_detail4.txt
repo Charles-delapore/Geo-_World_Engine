@@ -1,0 +1,18 @@
+F.F.                                                                     [100%]
+================================== FAILURES ===================================
+_ test_multi_seed_stability[\u4e00\u5ea7\u56db\u9762\u73af\u6d77\u7684\u5c9b\u5c7f\u3002-seed_13] _
+tests\test_golden_prompts.py:265: in test_multi_seed_stability
+    assert val <= threshold, f"seed={seed}: land_components={val}, expected <= {threshold}"
+E   AssertionError: seed=13: land_components=3, expected <= 2
+E   assert 3 <= 2
+_ test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_13] _
+tests\test_golden_prompts.py:265: in test_multi_seed_stability
+    assert val <= threshold, f"seed={seed}: land_components={val}, expected <= {threshold}"
+E   AssertionError: seed=13: land_components=4, expected <= 3
+E   assert 4 <= 3
+=========================== short test summary info ===========================
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e00\u5ea7\u56db\u9762\u73af\u6d77\u7684\u5c9b\u5c7f\u3002-seed_13]
+FAILED tests/test_golden_prompts.py::test_multi_seed_stability[\u4e1c\u897f\u5927\u9646\u4e2d\u95f4\u88ab\u6d77\u9694\u5f00\u3002-seed_13]
+2 failed, 2 passed, 32 deselected in 3.95s
+
+Return code: 1

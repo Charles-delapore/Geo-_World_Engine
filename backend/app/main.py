@@ -12,7 +12,7 @@ from app.rag.init_kb import init_builtin_knowledge_base
 from app.storage.models import init_db, session_scope
 
 
-app = FastAPI(title=settings.PROJECT_NAME, version="0.1.0")
+app = FastAPI(title=settings.PROJECT_NAME, version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -28,9 +28,18 @@ def startup() -> None:
     if settings.DATABASE_URL.startswith("sqlite"):
         init_db()
         with session_scope() as db:
-            db.execute(text("SELECT 1"))
+            db.execute(text("PRAGMA journal_mode=WAL"))
+            db.execute(text("PRAGMA synchronous=NORMAL"))
+            db.execute(text("PRAGMA busy_timeout=10000"))
+    else:
+        with session_scope() as db:
+            db.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        init_db()
     if settings.ENABLE_RAG:
-        init_builtin_knowledge_base(force=False)
+        try:
+            init_builtin_knowledge_base(force=False)
+        except Exception:
+            pass
 
 
 @app.get("/")

@@ -5,6 +5,7 @@ export interface CreateMapRequest {
   seed?: number
   auto_confirm: boolean
   generate_tiles: boolean
+  projection: 'flat' | 'planet'
 }
 
 export interface MapDiagnostics {
@@ -12,6 +13,8 @@ export interface MapDiagnostics {
   width: number
   height: number
   generationBackend: string
+  projection?: 'flat' | 'planet'
+  generateTiles?: boolean
   topologyIntent: string | null
   topologyModifiers: Record<string, string>
   layoutTemplate: string
@@ -47,4 +50,32 @@ export interface MapTask {
   diagnostics: MapDiagnostics
   createdAt: string
   updatedAt: string
+}
+
+export interface EditRequest {
+  instructions?: Array<Record<string, unknown>>
+  text_instruction?: string
+  sketch_geojson?: Record<string, unknown>
+}
+
+export interface EditResponse {
+  taskId: string
+  versionNum: number
+  editSummary: string
+  metricReport: Record<string, unknown> | null
+}
+
+export interface VersionInfo {
+  versionNum: number
+  editSummary: string | null
+  editType: string | null
+  parentVersion: number | null
+  createdAt: string
+}
+
+export interface TerrainFeature {
+  type: string
+  area?: number
+  count?: number
+  bounds?: { min_y: number; min_x: number; max_y: number; max_x: number }
 }

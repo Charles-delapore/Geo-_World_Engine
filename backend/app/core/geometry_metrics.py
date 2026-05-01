@@ -154,11 +154,10 @@ def mask_to_geojson(mask: np.ndarray) -> list[dict]:
     if not _HAS_SHAPELY:
         return []
     import json
-    from rasterio.features import shapes as rio_shapes
 
     _HAS_RASTERIO = False
     try:
-        from rasterio.features import shapes as _rio_shapes
+        from rasterio.features import shapes as rio_shapes
         _HAS_RASTERIO = True
     except ImportError:
         pass
@@ -167,7 +166,7 @@ def mask_to_geojson(mask: np.ndarray) -> list[dict]:
         return []
 
     results = []
-    for geom, value in _rio_shapes(mask.astype(np.uint8), mask=mask > 0):
+    for geom, value in rio_shapes(mask.astype(np.uint8), mask=mask > 0):
         if value > 0:
             results.append(geom)
     return results

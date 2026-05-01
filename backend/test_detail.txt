@@ -1,0 +1,10 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.13, pytest-9.0.3, pluggy-1.6.0
+rootdir: I:\K\Geo-worldEngine_B\GEO\backend
+configfile: pyproject.toml
+plugins: anyio-4.13.0
+collected 10 items / 10 deselected / 0 selected
+
+=========================== 10 deselected in 1.28s ============================
+
+---STDERR---

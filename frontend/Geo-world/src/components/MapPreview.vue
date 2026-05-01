@@ -6,11 +6,11 @@ defineProps<{
 </script>
 
 <template>
-  <div class="preview-shell">
+  <div v-show="visible" class="preview-shell">
     <img
-      v-if="previewUrl && visible"
-      class="preview-image"
+      v-if="previewUrl"
       :src="previewUrl"
+      class="preview-image"
       alt="World preview"
     />
   </div>

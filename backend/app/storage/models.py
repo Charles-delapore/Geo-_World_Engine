@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Iterator
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, Text, create_engine
+from sqlalchemy import JSON, Boolean, DateTime, Integer, Text, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
@@ -68,6 +68,18 @@ class TaskTransition(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class MapVersion(Base):
+    __tablename__ = "map_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(Text, index=True)
+    version_num: Mapped[int] = mapped_column(Integer)
+    edit_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edit_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parent_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 if _HAS_GEOALCHEMY2:
     class TerrainGeometry(Base):
         __tablename__ = "terrain_geometries"
@@ -82,7 +94,26 @@ if _HAS_GEOALCHEMY2:
 
 
 connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(settings.DATABASE_URL, future=True, connect_args=connect_args)
+engine = create_engine(
+    settings.DATABASE_URL,
+    future=True,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
+
+
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=10000")
+    cursor.execute("PRAGMA cache_size=-64000")
+    cursor.close()
+
+
+if settings.DATABASE_URL.startswith("sqlite"):
+    event.listen(engine, "connect", _set_sqlite_pragma)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 

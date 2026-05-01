@@ -49,6 +49,23 @@ class ArtifactRepository:
     def _object_key(self, *parts: str) -> str:
         return "/".join(part.strip("/\\") for part in parts)
 
+    def _save_zarr(self, path: Path, **arrays: np.ndarray) -> Path:
+        if path.exists():
+            import shutil
+
+            shutil.rmtree(path)
+        store = DirectoryStore(str(path))
+        group = zarr.group(store=store, overwrite=True)
+        for name, array in arrays.items():
+            np_array = np.asarray(array)
+            chunks = tuple(min(512, dim) for dim in np_array.shape)
+            group.array(name, data=np_array, chunks=chunks, overwrite=True)
+        return path
+
+    def _load_zarr(self, path: Path) -> dict[str, np.ndarray]:
+        group = zarr.open_group(store=DirectoryStore(str(path)), mode="r")
+        return {key: np.asarray(group[key]) for key in group.array_keys()}
+
     def save_preview(self, task_id: str, image: Image.Image) -> Path:
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
@@ -78,18 +95,7 @@ class ArtifactRepository:
                 temp_path.unlink(missing_ok=True)
             return self.world_path(task_id)
 
-        path = self.world_path(task_id)
-        if path.exists():
-            import shutil
-
-            shutil.rmtree(path)
-        store = DirectoryStore(str(path))
-        group = zarr.group(store=store, overwrite=True)
-        for name, array in arrays.items():
-            np_array = np.asarray(array)
-            chunks = tuple(min(512, dim) for dim in np_array.shape)
-            group.array(name, data=np_array, chunks=chunks, overwrite=True)
-        return path
+        return self._save_zarr(self.world_path(task_id), **arrays)
 
     def save_manifest(self, task_id: str, manifest: dict) -> Path:
         data = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
@@ -125,8 +131,7 @@ class ArtifactRepository:
 
         path = self.world_path(task_id)
         if path.exists():
-            group = zarr.open_group(store=DirectoryStore(str(path)), mode="r")
-            return {key: np.asarray(group[key]) for key in group.array_keys()}
+            return self._load_zarr(path)
 
         legacy_path = self.legacy_world_path(task_id)
         with np.load(legacy_path) as data:
@@ -172,6 +177,106 @@ class ArtifactRepository:
         path = self.task_dir(task_id) / "debug"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def cog_path(self, task_id: str) -> Path:
+        return self.task_dir(task_id) / "terrain.tif"
+
+    def save_cog(self, task_id: str, elevation: np.ndarray) -> Path:
+        from app.core.terrain_io import elevation_to_cog
+        path = self.cog_path(task_id)
+        return elevation_to_cog(elevation, path)
+
+    def load_cog(self, task_id: str) -> np.ndarray:
+        from app.core.terrain_io import geotiff_to_elevation
+        path = self.cog_path(task_id)
+        if path.exists():
+            return geotiff_to_elevation(path)
+        world = self.load_world(task_id)
+        return world.get("elevation", np.zeros((256, 512), dtype=np.float32))
+
+    def has_cog(self, task_id: str) -> bool:
+        return self.cog_path(task_id).exists()
+
+    def version_dir(self, task_id: str) -> Path:
+        path = self.task_dir(task_id) / "versions"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def immutable_version_dir(self, task_id: str, version_num: int) -> Path:
+        vdir = self.task_dir(task_id) / "versions" / f"v{version_num:04d}"
+        vdir.mkdir(parents=True, exist_ok=True)
+        return vdir
+
+    def save_version_full(
+        self,
+        task_id: str,
+        version_num: int,
+        elevation: np.ndarray,
+        preview: Image.Image | None = None,
+        manifest: dict | None = None,
+        edit_summary: str = "",
+        world_arrays: dict[str, np.ndarray] | None = None,
+    ) -> Path:
+        vdir = self.immutable_version_dir(task_id, version_num)
+        np.savez_compressed(vdir / "elevation.npz", elevation=elevation, edit_summary=edit_summary)
+        if world_arrays:
+            self._save_zarr(vdir / "world.zarr", **world_arrays)
+        if preview is not None:
+            preview.save(vdir / "preview.png", format="PNG")
+        if manifest is not None:
+            (vdir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        return vdir
+
+    def load_version_full(self, task_id: str, version_num: int) -> dict:
+        vdir = self.immutable_version_dir(task_id, version_num)
+        if not vdir.exists():
+            raise FileNotFoundError(f"Version {version_num} not found for task {task_id}")
+        result: dict = {"version_num": version_num}
+        elev_path = vdir / "elevation.npz"
+        if elev_path.exists():
+            with np.load(elev_path, allow_pickle=False) as data:
+                result["elevation"] = data["elevation"]
+                result["edit_summary"] = str(data.get("edit_summary", ""))
+        world_path = vdir / "world.zarr"
+        if world_path.exists():
+            result["world"] = self._load_zarr(world_path)
+        preview_path = vdir / "preview.png"
+        if preview_path.exists():
+            result["preview"] = Image.open(preview_path).convert("RGB")
+        manifest_path = vdir / "manifest.json"
+        if manifest_path.exists():
+            result["manifest"] = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return result
+
+    def save_version(self, task_id: str, version_num: int, elevation: np.ndarray, edit_summary: str = "") -> Path:
+        vdir = self.version_dir(task_id)
+        vdir.mkdir(parents=True, exist_ok=True)
+        path = vdir / f"v{version_num:04d}.npz"
+        np.savez_compressed(path, elevation=elevation, edit_summary=edit_summary)
+        return path
+
+    def load_version(self, task_id: str, version_num: int) -> tuple[np.ndarray, str]:
+        path = self.version_dir(task_id) / f"v{version_num:04d}.npz"
+        if not path.exists():
+            raise FileNotFoundError(f"Version {version_num} not found for task {task_id}")
+        with np.load(path, allow_pickle=False) as data:
+            return data["elevation"], str(data.get("edit_summary", ""))
+
+    def list_versions(self, task_id: str) -> list[int]:
+        vdir = self.version_dir(task_id)
+        if not vdir.exists():
+            return []
+        versions = []
+        for f in vdir.iterdir():
+            if f.name.startswith("v") and f.suffix == ".npz":
+                try:
+                    num = int(f.stem[1:])
+                    versions.append(num)
+                except ValueError:
+                    pass
+        return sorted(versions)
 
     def save_debug_image(self, task_id: str, name: str, image: Image.Image) -> Path:
         path = self.debug_dir(task_id) / f"{name}.png"
